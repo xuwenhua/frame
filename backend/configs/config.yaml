@@ -1,0 +1,61 @@
+# 应用配置
+app:
+  name: jikeai-clone
+  version: 0.1.0
+  port: 8080
+  mode: debug # debug / release
+  # 生成产物转存目录：上游（RunningHub）的结果 URL 24 小时失效，
+  # 任务 SUCCESS 后立即下载到这里，库里存本地 URL
+  result_dir: "/Users/xuwenhua/.jikeai-clone-data/results"
+  result_url_prefix: "/static/results"
+  # 任务并发上限：一个任务一个协程，有多少任务就同时提交多少；
+  # 上游并发/排队由网关自己处理（queueTimeoutMs），本地不节流。
+  # 这个值只是防失控兜底，正常批量远小于它。
+  max_concurrent_tasks: 200
+  # 分镜草图专用图像模型（管理端「模型配置」里的 ID）。
+  # 草图要求「纯黑白线条、构图准确」，和出资产图的模型诉求不同，单独指定。
+  # 留空则回退到图像分类的默认模型。当前：doubao-seedream-5.0-pro
+  sketch_model_id: "384122f1-ef2f-476b-b6f6-4a2ccea94858"
+
+# 数据库配置
+database:
+  driver: sqlite # sqlite / postgres / mysql
+  dsn: "/Users/xuwenhua/.jikeai-clone-data/jikeai.db?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000"
+  # postgres 示例:
+  # host: localhost
+  # port: 5432
+  # user: postgres
+  # password: postgres
+  # dbname: jikeai
+  # sslmode: disable
+
+# Redis 配置（可选，用于缓存和队列）
+redis:
+  enabled: false
+  addr: localhost:6379
+  password: ""
+  db: 0
+
+# JWT 配置
+jwt:
+  secret: your-secret-key-change-in-production
+  expire: 86400 # 24小时
+
+# 积分系统
+points:
+  identify_cost: 14 # 识别角色/场景
+  image_per_cost: 2 # 每张图片成本
+  video_per_cost: 35 # 视频生成成本
+
+# AI 服务配置（后续对接）
+ai:
+  openai:
+    api_key: ""
+    base_url: "https://api.openai.com/v1"
+    model: "gpt-4o"
+  runninghub:
+    api_key: ""
+    base_url: "https://www.runninghub.cn"
+  doubao:
+    api_key: ""
+    base_url: "https://ark.cn-beijing.volces.com/api/v3"

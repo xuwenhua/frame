@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jikeai-clone 项目计划方案</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: #f5f7fa;
+    color: #303133;
+    line-height: 1.7;
+    padding: 40px 20px;
+  }
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    overflow: hidden;
+  }
+  .header {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    color: #fff;
+    padding: 40px;
+  }
+  .header h1 { font-size: 28px; margin-bottom: 8px; }
+  .header p { opacity: 0.9; }
+  .content { padding: 40px; }
+  h2 {
+    font-size: 20px;
+    margin: 32px 0 16px;
+    padding-left: 12px;
+    border-left: 4px solid #6366f1;
+  }
+  h3 { font-size: 16px; margin: 20px 0 10px; color: #606266; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    border: 1px solid #ebeef5;
+    padding: 10px 14px;
+    text-align: left;
+  }
+  th { background: #f5f7fa; font-weight: 600; }
+  tr:hover { background: #f9fafc; }
+  .tag {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .tag-green { background: #e1f3d8; color: #67c23a; }
+  .tag-blue { background: #d9ecff; color: #409eff; }
+  .tag-orange { background: #fdf6ec; color: #e6a23c; }
+  .tag-red { background: #fef0f0; color: #f56c6c; }
+  .code-block {
+    background: #1e1e2e;
+    color: #a5d6ff;
+    padding: 16px;
+    border-radius: 8px;
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 13px;
+    overflow-x: auto;
+    margin: 12px 0;
+  }
+  ul, ol { padding-left: 24px; margin: 12px 0; }
+  li { margin: 6px 0; }
+  .timeline {
+    position: relative;
+    padding-left: 30px;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 8px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #6366f1;
+  }
+  .timeline-item {
+    position: relative;
+    margin-bottom: 24px;
+  }
+  .timeline-item::before {
+    content: '';
+    position: absolute;
+    left: -26px;
+    top: 6px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #6366f1;
+    border: 2px solid #fff;
+    box-shadow: 0 0 0 2px #6366f1;
+  }
+  .timeline-item h4 { color: #303133; margin-bottom: 4px; }
+  .timeline-item p { color: #909399; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>jikeai-clone 项目计划方案</h1>
+    <p>AI 短剧 SaaS 平台复刻 · Vue3 + Go 全栈架构</p>
+  </div>
+
+  <div class="content">
+    <h2>一、项目概述</h2>
+    <p>基于对「即刻AI」（jikeai.cc）的完整竞品分析，复刻其核心 AI 短剧创作链路：<strong>剧本 → 角色/场景/物品识别 → 批量生图 → 智能分镜工作台 → 视频生成</strong>。目标是用你现有的 RunningHub + Hypit 生态作为底层 AI 能力，搭建一个可自用、可分销的 Web 工作台。</p>
+
+    <h2>二、技术选型</h2>
+    <table>
+      <tr><th>层级</th><th>选型</th><th>理由</th></tr>
+      <tr><td>前端框架</td><td>Vue 3 + TypeScript + Vite</td><td>生态成熟、构建快、与你现有前端经验匹配</td></tr>
+      <tr><td>UI 组件库</td><td>Element Plus</td><td>中后台场景标配，表格/表单/对话框开箱即用</td></tr>
+      <tr><td>状态管理</td><td>Pinia</td><td>Vue3 官方推荐，TypeScript 友好</td></tr>
+      <tr><td>路由</td><td>Vue Router 4</td><td>标准选择</td></tr>
+      <tr><td>HTTP 客户端</td><td>Axios</td><td>带拦截器，方便统一注入 token / 错误处理</td></tr>
+      <tr><td>后端语言</td><td>Go 1.22+</td><td>你已选定；并发好、部署单二进制、适合 AI 任务队列</td></tr>
+      <tr><td>后端框架</td><td>Gin</td><td>轻量高性能，社区大</td></tr>
+      <tr><td>ORM</td><td>GORM</td><td>Go 生态最流行，支持 SQLite/PostgreSQL 切换</td></tr>
+      <tr><td>数据库</td><td>SQLite（起步）→ PostgreSQL（上线）</td><td>本地开发零依赖，上线平滑切换</td></tr>
+      <tr><td>配置管理</td><td>Viper / YAML</td><td>已内置 config.yaml</td></tr>
+      <tr><td>AI 能力对接</td><td>OpenAI API + RunningHub API + 豆包 API</td><td>分镜推理用 GPT、生图用 RunningHub G-2.5、生视频用 Seedance Mini</td></tr>
+    </table>
+
+    <h2>三、项目结构</h2>
+    <div class="code-block">
+jikeai-clone/
+├── frontend/                 # Vue3 前端
+│   ├── src/
+│   │   ├── api/             # Axios 封装
+│   │   ├── layouts/         # DashboardLayout 布局
+│   │   ├── router/         # 路由配置
+│   │   ├── stores/         # Pinia 状态
+│   │   ├── styles/         # 全局样式
+│   │   ├── types/          # TypeScript 类型
+│   │   ├── utils/         # 工具函数
+│   │   └── views/          # 页面组件
+│   │       ├── Dashboard.vue
+│   │       ├── ProjectList.vue
+│   │       └── ProjectDetail.vue
+│   └── vite.config.ts
+└── backend/                  # Go 后端
+    ├── cmd/server/main.go    # 入口
+    ├── internal/
+    │   ├── handler/         # HTTP 处理器
+    │   ├── middleware/      # CORS / Logger
+    │   ├── model/           # GORM 模型
+    │   └── service/         # 业务逻辑（LLM调用、积分扣减）
+    ├── pkg/
+    │   ├── config/          # 配置加载
+    │   └── database/        # 数据库初始化
+    └── configs/config.yaml   # 配置文件
+    </div>
+
+    <h2>四、核心模块拆分（对标即刻AI）</h2>
+    <table>
+      <tr><th>模块</th><th>功能</th><th>优先级</th></tr>
+      <tr><td>项目管理</td><td>创建/编辑/删除短剧项目，项目下挂多集剧集</td><td><span class="tag tag-red">P0</span></td></tr>
+      <tr><td>剧本录入</td><td>粘贴/导入剧本文本，分角色标注</td><td><span class="tag tag-red">P0</span></td></tr>
+      <tr><td>智能识别</td><td>LLM 识别角色、场景、物品，输出结构化字段</td><td><span class="tag tag-red">P0</span></td></tr>
+      <tr><td>批量生图</td><td>对接 RunningHub G-2.5，给每个角色/场景出参考图</td><td><span class="tag tag-orange">P1</span></td></tr>
+      <tr><td>分镜工作台</td><td>左文案 / 中素材 / 右描述词三栏布局，@-mention 引用资产</td><td><span class="tag tag-orange">P1</span></td></tr>
+      <tr><td>视频生成</td><td>调用 Seedance Mini / Wan 3.0，按分镜批量出片</td><td><span class="tag tag-blue">P2</span></td></tr>
+      <tr><td>积分系统</td><td>识别扣 14、生图扣 2/张、视频扣 35/条</td><td><span class="tag tag-orange">P1</span></td></tr>
+      <tr><td>爆款转绘</td><td>输入竞品视频链接，自动拆解复刻</td><td><span class="tag tag-green">P3</span></td></tr>
+      <tr><td>Agent 画布</td><td>可视化工作流编排（远期）</td><td><span class="tag tag-green">P3</span></td></tr>
+    </table>
+
+    <h2>五、数据模型设计</h2>
+    <h3>5.1 Project（短剧项目）</h3>
+    <ul>
+      <li>ID, Name, Description, Status（草稿/制作中/已完成）</li>
+      <li>UserID, CreatedAt, UpdatedAt</li>
+    </ul>
+
+    <h3>5.2 Episode（剧集）</h3>
+    <ul>
+      <li>ID, ProjectID, EpisodeNumber, Title</li>
+      <li>ScriptText（原始剧本）, Status</li>
+    </ul>
+
+    <h3>5.3 Character / Scene / Item（识别结果）</h3>
+    <ul>
+      <li>Character: name, identity_anchor, costume_prompt, personality, appearance_cues, reference_image</li>
+      <li>Scene: name, spatial_anchor, lighting_prompt, time_of_day, reference_image</li>
+      <li>Item: name, category, prompt, reference_image</li>
+    </ul>
+
+    <h3>5.4 Storyboard（分镜）</h3>
+    <ul>
+      <li>ID, EpisodeID, FrameIndex</li>
+      <li>Text（人读脚本，~400字）, VideoPrompt（机读prompt，~1200字）</li>
+      <li>Roles[], Scenes[], Items[]（@-mention 引用）</li>
+      <li>VideoModel（doubao-seedance-2.0-mini）, VideoURL, Duration</li>
+    </ul>
+
+    <h2>六、开发排期</h2>
+    <div class="timeline">
+      <div class="timeline-item">
+        <h4>Phase 1：基础骨架（本周）</h4>
+        <p>前后端项目跑通，Dashboard 可访问，项目 CRUD 接口联通。Go 安装完成后 go mod tidy + 启动。</p>
+      </div>
+      <div class="timeline-item">
+        <h4>Phase 2：剧本 + 识别（1-2 周）</h4>
+        <p>接入 OpenAI API，实现「粘贴剧本 → 一键识别角色/场景/物品」，输出结构化 JSON 并入库。</p>
+      </div>
+      <div class="timeline-item">
+        <h4>Phase 3：生图 + 素材库（2-3 周）</h4>
+        <p>对接 RunningHub G-2.5 API，给每个识别结果自动出参考图，支持手动换图/迭代。</p>
+      </div>
+      <div class="timeline-item">
+        <h4>Phase 4：分镜工作台（2-3 周）</h4>
+        <p>实现三栏布局，两次 LLM 调用生成 text + video_prompt，支持 @-mention 拖拽引用。</p>
+      </div>
+      <div class="timeline-item">
+        <h4>Phase 5：视频生成 + 积分（1-2 周）</h4>
+        <p>对接 Seedance Mini，批量生成视频，积分扣减闭环。</p>
+      </div>
+      <div class="timeline-item">
+        <h4>Phase 6：爆款转绘 + 上线（远期）</h4>
+        <p>竞品链接解析、字幕擦除、分销链接生成。</p>
+      </div>
+    </div>
+
+    <h2>七、当前已完成的工作</h2>
+    <table>
+      <tr><th>项目</th><th>状态</th></tr>
+      <tr><td>前端 Vue3 + TS + Vite 项目初始化</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>Element Plus / Pinia / Vue Router / Axios 安装</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>Dashboard / ProjectList / ProjectDetail 页面骨架</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>DashboardLayout 侧边栏布局</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>Vite 代理配置（/api → localhost:8080）</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>后端 Go 目录结构 + Gin 路由骨架</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>config.yaml 配置文件（含 AI / 积分参数）</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>CORS / Logger 中间件</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>项目/剧集/识别/分镜/积分 Handler 骨架</td><td><span class="tag tag-green">已完成</span></td></tr>
+      <tr><td>Go 语言安装（Homebrew）</td><td><span class="tag tag-orange">进行中</span></td></tr>
+      <tr><td>GORM 模型定义 + 自动迁移</td><td><span class="tag tag-red">待开始</span></td></tr>
+      <tr><td>LLM 调用封装（OpenAI / RunningHub / 豆包）</td><td><span class="tag tag-red">待开始</span></td></tr>
+      <tr><td>分镜工作台 UI 实现</td><td><span class="tag tag-red">待开始</span></td></tr>
+    </table>
+
+    <h2>八、下一步立即执行的事</h2>
+    <ol>
+      <li>等 Go 安装完成后，进入 <code>backend/</code> 执行 <code>go mod tidy</code> 拉依赖</li>
+      <li>实现 GORM Model（Project / Episode / Character / Scene / Item / Storyboard）</li>
+      <li>把 handler 里的 mock 数据换成真实数据库读写</li>
+      <li>启动后端 + 前端，验证项目列表能联通</li>
+    </ol>
+  </div>
+</div>
+</body>
+</html>

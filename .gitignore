@@ -1,0 +1,27 @@
+# 系统文件
+.DS_Store
+
+# 调试截图（项目根目录，都是开发过程中的页面截图，不是代码）
+/*.png
+
+# 前端根目录的调试截图（src/assets 里的资源要保留）
+frontend/*.png
+
+# 后端构建产物（单个二进制 24MB）
+backend/bin/
+
+# 数据库与本地数据（含用户、积分、模型密钥，绝不能进仓库）
+backend/data/
+backend/.data/
+*.db
+*.db-wal
+*.db-shm
+
+# 依赖与构建产物
+node_modules/
+frontend/dist/
+
+# 编辑器异常退出留下的临时副本（原名 + 6 位随机字符）
+backend/internal/handler/episode.goZffVXP
+frontend/src/views/ProjectDetail.vueJRgpas
+frontend/src/views/admin/Dashboard.vuerH1sdb

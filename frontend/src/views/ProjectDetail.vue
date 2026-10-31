@@ -1,0 +1,2714 @@
+<script setup lang="ts">
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import api from '../api'
+import PillSelect from '../components/PillSelect.vue'
+import PillToggle from '../components/PillToggle.vue'
+import CharStylePreview from '../components/CharStylePreview.vue'
+import SceneStylePreview from '../components/SceneStylePreview.vue'
+import { toast } from '../composables/useToast'
+import { confirmDialog } from '../composables/useConfirm'
+import { mergeLatestTasks, isTaskRunning } from '../utils/taskState'
+
+interface PillOption {
+  value: string
+  label: string
+  hint?: string
+  badge?: string
+}
+
+const route = useRoute()
+const router = useRouter()
+const projectId = route.params.id as string
+
+interface Project { id: string; name: string; description: string; status: string }
+
+const project = ref<Project | null>(null)
+const loading = ref(true)
+const step = ref(0)
+
+// 已解锁到哪一步。只增不减：从分镜点回资产后，分镜仍要能点回去。
+const maxStep = ref(0)
+watch(step, (v) => { if (v > maxStep.value) maxStep.value = v }, { immediate: true })
+
+// ---------- 剧本 ----------
+const script = ref('')
+const episodeId = ref('')
+const savingScript = ref(false)
+
+const episodes = ref<any[]>([])
+const curEpisode = ref<any | null>(null)
+
+/** 面包屑最后一节：第N集，title 里已写「第N集」时不重复拼 */
+const episodeCrumb = computed(() => {
+  const ep = curEpisode.value
+  if (!ep) return ''
+  const n = Number(ep.episodeNumber) || 1
+  const t = String(ep.title || '').trim()
+  if (!t) return `第${n}集`
+  if (/第\s*[0-9０-９一二三四五六七八九十]+\s*集/.test(t)) return t
+  return `第${n}集：${t}`
+})
+
+// ---------- 资产 ----------
+const assets = ref<{ characters: any[]; scenes: any[]; items: any[] }>({
+  characters: [], scenes: [], items: []
+})
+const identifying = ref(false)
+
+// 资产出图工具栏
+const genOpts = ref({
+  modelId: '',
+  resolution: '1K',
+  charStyle: 'asset',
+  sceneStyle: 'single',
+  /** 角色名开关：开启后只有角色参考图左上角显示名字，场景与道具不显示 */
+  showName: true
+})
+
+const RES_OPTIONS: PillOption[] = [
+  { value: '1K', label: '1K', hint: '出图更快，长度够用' },
+  { value: '2K', label: '2K', hint: '提示词追加高精度细节要求' }
+]
+
+const CHAR_STYLE_OPTIONS: PillOption[] = [
+  { value: 'asset', label: '人物资产图', badge: '16:9', hint: '正面全身、背面全身与正面胸像' },
+  { value: 'quad', label: '人物四视图', badge: '3:4', hint: '正侧脸特写、正面服装与背面全身' },
+  { value: 'concept', label: '人物概念图', badge: '16:9', hint: '整体设计与服饰细节' },
+  { value: 'closeup', label: '特写三视图', badge: '16:9', hint: '突出面部表情和细节' }
+]
+
+const SCENE_STYLE_BASE = [
+  { value: 'single', label: '单一场景视图', hint: '一个平视主视角' },
+  { value: 'multi', label: '多角度视图', hint: '主视角 + 俯视 + 局部细节' },
+  { value: 'concept', label: '场景概念图', hint: '整体氛围与陈设细节' },
+  { value: 'wide', label: '广角全景', hint: '超广角展示空间纵深' }
+]
+
+/** 剧本探测出的视觉约束（后端 identify 返回） */
+const scriptStyle = ref<{ vertical: boolean; noFace: boolean; desc: string }>({
+  vertical: false, noFace: false, desc: ''
+})
+
+const sceneAspect = (style: string) =>
+  style === 'single' ? (scriptStyle.value.vertical ? '9:16' : '4:3') : '16:9'
+
+const SCENE_STYLE_OPTIONS = computed<PillOption[]>(() =>
+  SCENE_STYLE_BASE.map((o) => ({ ...o, badge: sceneAspect(o.value) }))
+)
+
+/** 当前角色样式 / 场景样式（下拉预览用） */
+const charStyleMeta = computed(
+  () => CHAR_STYLE_OPTIONS.find((o) => o.value === genOpts.value.charStyle) || CHAR_STYLE_OPTIONS[0]
+)
+const sceneStyleMeta = computed(
+  () => SCENE_STYLE_OPTIONS.value.find((o) => o.value === genOpts.value.sceneStyle) || SCENE_STYLE_OPTIONS.value[0]
+)
+
+// ---------- 图像 / 视频模型 ----------
+const imageModels = ref<any[]>([])
+const videoModels = ref<any[]>([])
+
+const modelOptions = computed<PillOption[]>(() =>
+  imageModels.value.map((m) => {
+    const need = Number(m.needRefImages ?? 0)
+    const noKey = m.hasKey === false
+    let hint = need > 0 ? `需 ${need} 张参考图 · 仅支持图生图` : '文生图 · 可直接批量'
+    if (noKey) hint = '未配置 Token，选了会直接失败'
+    return {
+      value: m.id,
+      label: (m.displayName || m.id) + (noKey ? '（未配 Token）' : ''),
+      hint
+    }
+  })
+)
+
+const videoModelOptions = computed<PillOption[]>(() =>
+  videoModels.value.map((m) => {
+    const dur = Number(m.duration ?? 0)
+    const ar = m.aspectRatio ? ` · ${m.aspectRatio}` : ''
+    return {
+      value: m.id,
+      label: m.displayName || m.id,
+      hint: (dur > 0 ? `默认 ${dur} 秒${ar}` : '按分镜时长') + (m.hasKey === false ? ' · 未配 Token' : '')
+    }
+  })
+)
+
+const loadModels = async () => {
+  try {
+    const [im, vm]: any[] = await Promise.all([
+      api.get('/models', { params: { category: 'image' } }),
+      api.get('/models', { params: { category: 'video' } })
+    ])
+    imageModels.value = im.data || []
+    videoModels.value = vm.data || []
+    // 默认选「有 key 且是默认」的那个，避免一进来就选到没配 token 的模型
+    if (!genOpts.value.modelId) {
+      const def = imageModels.value.find((m: any) => m.isDefault && m.hasKey !== false)
+        || imageModels.value.find((m: any) => m.hasKey !== false)
+      if (def) genOpts.value.modelId = def.id
+    }
+    if (!videoModel.value || !videoModels.value.some((m: any) => m.id === videoModel.value)) {
+      const def = videoModels.value.find((m: any) => m.isDefault && m.hasKey !== false)
+        || videoModels.value.find((m: any) => m.hasKey !== false)
+      if (def) videoModel.value = def.id
+    }
+  } catch {
+    /* 模型清单拿不到不阻塞页面 */
+  }
+}
+
+// ---------- 分镜 ----------
+const frames = ref<any[]>([])
+const generating = ref(false)
+const activeFrame = ref(0)
+
+/** 画幅与视频模型属于这一集，存 episodes 表；时长按每帧描述词单独算 */
+const sbRatio = ref<'16:9' | '9:16'>('16:9')
+const sbDuration = ref('15')
+const videoModel = ref('')
+const epCfg = { ratio: '', model: '' }
+
+const RATIO_OPTIONS: PillOption[] = [
+  { value: '16:9', label: '横屏 16:9', hint: '常规短剧 / 影视' },
+  { value: '9:16', label: '竖屏 9:16', hint: '抖音 / 视频号' }
+]
+
+const DURATION_OPTIONS: PillOption[] = [
+  { value: '15', label: '15 秒上限', hint: '一段最多 15 秒，按台词自动收短' },
+  { value: '12', label: '12 秒上限', hint: '节奏更紧，口型更准' },
+  { value: '10', label: '10 秒上限', hint: '单段台词少，适合快剪' },
+  { value: 'auto', label: '自动', hint: '完全按台词字数估算' }
+]
+
+const applyEpisodeConfig = (ep: any) => {
+  const ratio = ep?.aspectRatio === '9:16' ? '9:16' : '16:9'
+  const model = ep?.videoModel || ''
+  epCfg.ratio = ratio
+  epCfg.model = model
+  sbRatio.value = ratio
+  if (model) videoModel.value = model
+}
+
+const saveEpisodeConfig = async (patch: Record<string, any>) => {
+  if (!episodeId.value) return
+  try {
+    await api.put(`/episodes/${episodeId.value}/config`, patch)
+  } catch {
+    /* 配置保存失败不打断当前操作 */
+  }
+}
+
+watch(sbRatio, (v) => {
+  if (v === epCfg.ratio) return
+  epCfg.ratio = v
+  void saveEpisodeConfig({ aspectRatio: v })
+})
+watch(videoModel, (v) => {
+  if (!v || v === epCfg.model) return
+  epCfg.model = v
+  void saveEpisodeConfig({ videoModel: v })
+})
+
+/** 「auto」→ 0（后端按台词估算）；「15」→ 15 */
+const sbSeconds = computed(() => {
+  if (sbDuration.value === 'auto') return 0
+  const n = parseInt(sbDuration.value, 10)
+  return Number.isFinite(n) && n > 0 ? n : 0
+})
+
+const totalDuration = computed(() =>
+  Math.round(frames.value.reduce((s: number, f: any) => s + (Number(f.duration) || 0), 0))
+)
+const doneVideoCount = computed(() => frames.value.filter((f) => f.videoUrl).length)
+const pendingVideoCount = computed(() => frames.value.filter((f) => !f.videoUrl).length)
+const missingImages = computed(() => {
+  const all = [...assets.value.characters, ...assets.value.scenes, ...assets.value.items]
+  return all.filter((a) => !a.referenceImage).length
+})
+
+/** 资产三段（角色/场景/道具）统一成一张表，模板里少写三份重复结构 */
+const assetSections = computed(() => [
+  { key: 'characters', type: 'character', thumbCls: 'person', label: '角色', cls: 'role', empty: '剧本里没提到明确的人物名', desc: 'imagePrompt', list: assets.value.characters },
+  { key: 'scenes', type: 'scene', thumbCls: 'scene', label: '场景', cls: 'scene', empty: '剧本里没标注场景', desc: 'imagePrompt', list: assets.value.scenes },
+  { key: 'items', type: 'item', thumbCls: 'item', label: '道具', cls: 'item', empty: '剧本里没识别到关键道具', desc: 'imagePrompt', list: assets.value.items }
+])
+
+/**
+ * 这一段的参考图比例：跟着出图样式变。
+ * 角色：四视图 3:4，其余 16:9；场景：单一视图跟剧本画幅（竖版 9:16 / 横版 4:3），
+ * 多角度与广角 16:9；道具固定 1:1。卡片上的比例标就是给用户确认「出图会是什么画幅」。
+ */
+const ratioOf = (type: string) => {
+  if (type === 'item') return '1:1'
+  if (type === 'character') return genOpts.value.charStyle === 'quad' ? '3:4' : '16:9'
+  return sceneAspect(genOpts.value.sceneStyle)
+}
+
+// ---------- 任务轮询 ----------
+const taskMap = ref<Record<string, any>>({})
+let pollTimer: number | null = null
+const batchRunning = ref(false)
+const generatingVideo = ref(false)
+
+const stopPolling = () => {
+  if (pollTimer !== null) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+const pollTasks = (onDone?: () => void) => {
+  if (!episodeId.value) return
+  stopPolling()
+  pollTimer = window.setInterval(async () => {
+    try {
+      const res: any = await api.get('/tasks', { params: { episodeId: episodeId.value } })
+      const { map, pending } = mergeLatestTasks(res.data || [])
+      taskMap.value = map
+      if (pending === 0) {
+        stopPolling()
+        batchRunning.value = false
+        generatingVideo.value = false
+        await loadAssets()
+        await loadFrames()
+        onDone && onDone()
+      }
+    } catch {
+      /* 轮询失败继续下一次 */
+    }
+  }, 2000)
+}
+
+const taskOf = (id: string) => taskMap.value[id]
+
+// ---------- 加载 ----------
+const loadAssets = async () => {
+  if (!episodeId.value) return
+  try {
+    const res: any = await api.get('/identify', { params: { episodeId: episodeId.value } })
+    assets.value = {
+      characters: res.data?.characters || [],
+      scenes: res.data?.scenes || [],
+      items: res.data?.items || []
+    }
+    if (res.data?.style) scriptStyle.value = res.data.style
+  } catch {
+    /* 没识别过就是空 */
+  }
+}
+
+const loadFrames = async () => {
+  if (!episodeId.value) return
+  try {
+    const res: any = await api.get('/storyboard', { params: { episodeId: episodeId.value } })
+    frames.value = res.data?.frames || []
+    if (activeFrame.value >= frames.value.length) activeFrame.value = 0
+  } catch {
+    /* 没有分镜就是空 */
+  }
+}
+
+const loadFirstFrameGroups = async () => {
+  if (!episodeId.value) return
+  try {
+    const res: any = await api.get(`/episodes/${episodeId.value}/firstframes`)
+    ffGroups.value = res.data || []
+  } catch {
+    ffGroups.value = []
+  }
+}
+
+const load = async () => {
+  loading.value = true
+  try {
+    const res: any = await api.get(`/projects/${projectId}`)
+    project.value = res.data
+
+    const eps: any = await api.get('/episodes', { params: { projectId } })
+    episodes.value = eps.data || []
+    if (episodes.value.length > 0) {
+      const ep = episodes.value[0]
+      episodeId.value = ep.id
+      curEpisode.value = ep
+      script.value = ep.scriptText || ''
+      applyEpisodeConfig(ep)
+      await Promise.all([loadAssets(), loadFrames(), loadFirstFrameGroups()])
+
+      if (frames.value.length > 0) step.value = 2
+      else if (assets.value.characters.length > 0) step.value = 1
+    }
+  } catch (e: any) {
+    toast.error('加载失败', e.response?.data?.message || e.message)
+  } finally {
+    loading.value = false
+  }
+}
+
+// ---------- 剧本 / 识别 ----------
+const ensureEpisode = async (): Promise<string> => {
+  if (episodeId.value) {
+    await api.put(`/episodes/${episodeId.value}/script`, { scriptText: script.value })
+    return episodeId.value
+  }
+  const res: any = await api.post('/episodes', {
+    projectId,
+    episodeNumber: 1,
+    title: '第一集',
+    scriptText: script.value
+  })
+  episodeId.value = res.data.id
+  curEpisode.value = res.data
+  episodes.value = [res.data]
+  return episodeId.value
+}
+
+const saveScript = async () => {
+  if (savingScript.value) return
+  savingScript.value = true
+  try {
+    await ensureEpisode()
+    toast.success('草稿已保存')
+  } catch (e: any) {
+    toast.error('保存失败', e.response?.data?.message || e.message)
+  } finally {
+    savingScript.value = false
+  }
+}
+
+const identify = async () => {
+  if (!script.value.trim()) return toast.warning('请先填写剧本')
+  identifying.value = true
+  try {
+    const eid = await ensureEpisode()
+    const res: any = await api.post('/identify', { episodeId: eid })
+    assets.value = {
+      characters: res.data?.characters || [],
+      scenes: res.data?.scenes || [],
+      items: res.data?.items || []
+    }
+    if (res.data?.style) scriptStyle.value = res.data.style
+    step.value = 1
+    toast.success(
+      `识别到 ${assets.value.characters.length} 个角色、${assets.value.scenes.length} 个场景、${assets.value.items.length} 个道具`
+    )
+  } catch (e: any) {
+    toast.error('识别失败', e.response?.data?.message || e.message)
+  } finally {
+    identifying.value = false
+  }
+}
+
+// ---------- 生成分镜 ----------
+const generateStoryboard = async () => {
+  if (!episodeId.value) return toast.warning('请先识别资产')
+  if (frames.value.length > 0) {
+    const ok = await confirmDialog({
+      title: '重新生成分镜？',
+      desc: `当前 ${frames.value.length} 段分镜会被覆盖（已生成的视频保留在任务记录里，但分镜行会重建）。`,
+      confirmText: '重新生成',
+      danger: true
+    })
+    if (!ok) return
+  }
+  generating.value = true
+  try {
+    const res: any = await api.post('/storyboard/generate', {
+      episodeId: episodeId.value,
+      duration: sbSeconds.value
+    })
+    frames.value = res.data?.frames || []
+    activeFrame.value = 0
+    step.value = 2
+    const engine = res.data?.engine
+    const n = frames.value.length
+    if (engine === 'llm') {
+      toast.success(`生成 ${n} 段分镜`, res.data?.model ? `模型：${res.data.model}` : undefined)
+    } else {
+      // 降级必须显式提示：否则用户看到的是「抠句子」的结果，以为模型不行
+      toast.warning(`生成 ${n} 段分镜（规则引擎兜底）`, res.data?.warning || '文本模型不可用，内容质量会明显下降')
+    }
+    await loadFirstFrameGroups()
+  } catch (e: any) {
+    toast.error('生成失败', e.response?.data?.message || e.message)
+  } finally {
+    generating.value = false
+  }
+}
+
+const activeFrameData = computed(() => frames.value[activeFrame.value] || null)
+
+const saveFrame = async () => {
+  const f = activeFrameData.value
+  if (!f) return
+  try {
+    const res: any = await api.put(`/storyboard/${f.id}`, {
+      text: f.text,
+      videoPrompt: f.videoPrompt,
+      duration: Number(f.duration) || 0
+    })
+    Object.assign(f, res.data)
+    toast.success('已保存')
+  } catch (e: any) {
+    toast.error('保存失败', e.response?.data?.message || e.message)
+  }
+}
+
+const regenerateFrame = async () => {
+  const f = activeFrameData.value
+  if (!f) return
+  try {
+    const res: any = await api.post(`/storyboard/${f.id}/regenerate`)
+    Object.assign(f, res.data)
+    toast.success('已重新生成')
+  } catch (e: any) {
+    toast.error('重生成失败', e.response?.data?.message || e.message)
+  }
+}
+
+// ---------- 资产出图 ----------
+const genPayload = () => ({
+  modelId: genOpts.value.modelId || undefined,
+  resolution: genOpts.value.resolution,
+  charStyle: genOpts.value.charStyle,
+  sceneStyle: genOpts.value.sceneStyle
+})
+
+const batchGenerateImages = async () => {
+  if (!episodeId.value) return
+  batchRunning.value = true
+  try {
+    const res: any = await api.post('/generate/images', { episodeId: episodeId.value, ...genPayload() })
+    const count = res.data?.count || 0
+    toast.success(`已提交 ${count} 个出图任务`, `消耗 ${res.data?.cost || 0} 积分`)
+    pollTasks(() => toast.success('参考图已全部生成'))
+  } catch (e: any) {
+    batchRunning.value = false
+    toast.error('提交失败', e.response?.data?.message || e.message)
+  }
+}
+
+const regenAssetImage = async (assetType: string, assetId: string) => {
+  taskMap.value[assetId] = { status: 'pending', progress: 0 }
+  try {
+    await api.post('/generate/image', { assetType, assetId, ...genPayload() })
+    pollTasks(() => toast.success('参考图已更新'))
+  } catch (e: any) {
+    delete taskMap.value[assetId]
+    toast.error('生成失败', e.response?.data?.message || e.message)
+  }
+}
+
+// ---------- 资产：编辑 / 删除 / 大图 ----------
+const editOpen = ref(false)
+const editType = ref<'character' | 'scene' | 'item'>('character')
+const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', voiceTone: '' })
+const editSaving = ref(false)
+const uploading = ref(false)
+const viewerSrc = ref('')
+
+const viewImage = (src?: string) => {
+  if (src) viewerSrc.value = src
+}
+
+const openEdit = (type: 'character' | 'scene' | 'item', a: any) => {
+  editType.value = type
+  editForm.value = {
+    id: a.id,
+    name: a.name || '',
+    imagePrompt: a.imagePrompt || '',
+    referenceImage: a.referenceImage || '',
+    voiceTone: a.voiceTone || ''
+  }
+  editOpen.value = true
+}
+
+/** 换参考图：先传到 /upload 拿 URL，保存时才写进资产 */
+const uploadRef = async (e: Event) => {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  uploading.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('kind', 'image')
+    const res: any = await api.post('/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+    editForm.value.referenceImage = res.data?.url || ''
+    toast.success('已上传，点保存生效')
+  } catch (err: any) {
+    toast.error('上传失败', err.response?.data?.message || err.message)
+  } finally {
+    uploading.value = false
+    input.value = ''
+  }
+}
+
+const saveAsset = async () => {
+  const f = editForm.value
+  if (!f.id || editSaving.value) return
+  if (!f.name.trim()) return toast.warning('名称不能为空')
+  editSaving.value = true
+  try {
+    const payload: Record<string, any> = { name: f.name, imagePrompt: f.imagePrompt }
+    if (f.referenceImage) payload.referenceImage = f.referenceImage
+    if (editType.value === 'character') payload.voiceTone = f.voiceTone
+    const res: any = await api.put(`/assets/${editType.value}/${f.id}`, payload)
+    const list = assetSections.value.find((x) => x.type === editType.value)?.list || []
+    const hit = list.find((x: any) => x.id === f.id)
+    if (hit) Object.assign(hit, res.data || {})
+    toast.success('已保存')
+    editOpen.value = false
+  } catch (e: any) {
+    toast.error('保存失败', e.response?.data?.message || e.message)
+  } finally {
+    editSaving.value = false
+  }
+}
+
+const removeAsset = async (type: string, a: any) => {
+  const ok = await confirmDialog({
+    title: `删除「${a.name}」？`,
+    desc: '删除后这一集的分镜里对它的引用会失效，需要重新识别或手动加回。',
+    confirmText: '删除',
+    danger: true
+  })
+  if (!ok) return
+  try {
+    await api.delete(`/assets/${type}/${a.id}`)
+    await loadAssets()
+    toast.success('已删除')
+  } catch (e: any) {
+    toast.error('删除失败', e.response?.data?.message || e.message)
+  }
+}
+
+// ---------- 视频 ----------
+const generateOneVideo = async (f: any) => {
+  if (!f) return
+  const dur = Math.max(1, Math.round(Number(f.duration) || 5))
+  taskMap.value[f.id] = { status: 'pending', progress: 0 }
+  try {
+    await api.post('/generate/video', {
+      storyboardId: f.id,
+      modelId: videoModel.value || undefined,
+      duration: dur,
+      aspectRatio: sbRatio.value
+    })
+    toast.success(`已提交第 ${f.frameIndex} 段视频`, `${dur} 秒 · ${sbRatio.value}`)
+    pollTasks()
+  } catch (e: any) {
+    delete taskMap.value[f.id]
+    toast.error('提交失败', e.response?.data?.message || e.message)
+  }
+}
+
+const generateVideos = async () => {
+  if (!frames.value.length) return
+  const todo = frames.value.filter((f) => !f.videoUrl)
+  if (!todo.length) return toast.info('全部分镜已出片')
+  const ok = await confirmDialog({
+    title: `生成 ${todo.length} 段视频？`,
+    desc: '按每段自己的时长逐条提交，提交后可在本页等待完成。',
+    confirmText: '开始生成'
+  })
+  if (!ok) return
+
+  generatingVideo.value = true
+  let submitted = 0
+  for (const f of todo) {
+    try {
+      await api.post('/generate/video', {
+        storyboardId: f.id,
+        modelId: videoModel.value || undefined,
+        duration: Math.max(1, Math.round(Number(f.duration) || 5)),
+        aspectRatio: sbRatio.value
+      })
+      submitted++
+    } catch (e: any) {
+      // 单个失败不中断整批，但把原因说出来
+      if (e.response?.status === 402) {
+        toast.error('积分不足', e.response?.data?.message || '')
+        break
+      }
+    }
+  }
+  if (submitted === 0) {
+    generatingVideo.value = false
+    toast.error('没有提交成功的任务')
+    return
+  }
+  toast.success(`已提交 ${submitted} 段视频`)
+  pollTasks(() => toast.success('视频已全部生成'))
+}
+
+// ---------- 首帧规划 ----------
+const ffGroups = ref<any[]>([])
+const ffPlanOpen = ref(false)
+const ffPlanning = ref(false)
+const ffGenBusy = ref(false)
+
+const parseIdx = (s: string): number[] => {
+  try {
+    const v = JSON.parse(s || '[]')
+    return Array.isArray(v) ? v : []
+  } catch {
+    return []
+  }
+}
+
+const ffGroupOfFrame = (frameIndex: number) => {
+  for (const g of ffGroups.value) {
+    if (parseIdx(g.frameIndexes).includes(frameIndex)) return g
+  }
+  return null
+}
+
+/** 当前段所属的首帧分组（可能没有：还没规划过） */
+const activeGroup = computed(() => {
+  const f = activeFrameData.value
+  if (!f) return null
+  return ffGroupOfFrame(f.frameIndex)
+})
+
+/** 覆盖段太多时只显示数量，否则标题会被挤成好几行 */
+const coverText = (g: any) => {
+  const idx = parseIdx(g?.frameIndexes || '')
+  if (!idx.length) return ''
+  return idx.length > 6 ? `覆盖 ${idx.length} 段` : `覆盖段 ${idx.join('、')}`
+}
+
+/** 当前段所属的那组参考图正在重新生成（详情区要显示等待遮罩） */
+const ffRefreshing = computed(() => !!activeGroup.value && isFfBusy(activeGroup.value))
+
+/** 左栏有没有东西可放：有视频、正在生成、或有场景全景参考图 */
+const hasMedia = computed(() => {
+  const f = activeFrameData.value
+  if (!f) return false
+  return !!f.videoUrl || isTaskRunning(taskOf(f.id)) || !!activeGroup.value?.image
+})
+
+const planFirstFrames = async () => {
+  if (!episodeId.value || ffPlanning.value) return
+  ffPlanning.value = true
+  try {
+    const res: any = await api.post(`/episodes/${episodeId.value}/firstframe-plan`)
+    ffGroups.value = res.data?.groups || []
+    ffPlanOpen.value = true
+    toast.success(res.message || '规划完成')
+  } catch (e: any) {
+    toast.error('规划失败', e.response?.data?.message || e.message)
+  } finally {
+    ffPlanning.value = false
+  }
+}
+
+const openFirstFramePanel = async () => {
+  await loadFirstFrameGroups()
+  if (!ffGroups.value.length) {
+    toast.info('还没有首帧规划', '先点「首帧规划」生成分组')
+    return
+  }
+  ffPlanOpen.value = true
+}
+
+/** 这次正在生成哪几组（用来给缩略图加遮罩，而不是整块都在转圈） */
+const ffBusyIds = ref<string[]>([])
+
+/** 某一组是不是正在生成 */
+const isFfBusy = (g: any) => ffGenBusy.value && !!g && ffBusyIds.value.includes(g.id)
+
+const genFirstFrameGroups = async () => {
+  if (!episodeId.value || ffGenBusy.value) return
+  ffGenBusy.value = true
+  ffBusyIds.value = ffGroups.value.map((g: any) => g.id)
+
+  // 生成前的图：重生成时 URL 会换一个，拿它判断「这一组换图了没有」。
+  // 只判断「有图」不行 —— 重生成时本来就有旧图，会立刻被当成完成。
+  const before = new Map<string, string>(ffGroups.value.map((g: any) => [g.id, g.image || '']))
+
+  try {
+    const res: any = await api.post(`/episodes/${episodeId.value}/firstframes/generate`, {})
+    toast.success(res.message || '已提交，正在生成')
+    let tries = 0
+    const timer = window.setInterval(async () => {
+      tries++
+      try {
+        const r: any = await api.get(`/episodes/${episodeId.value}/firstframes`)
+        ffGroups.value = r.data || []
+      } catch { /* 轮询失败不打断 */ }
+      const done = ffGroups.value.filter((g: any) => {
+        if (!ffBusyIds.value.includes(g.id)) return true
+        const prev = before.get(g.id) || ''
+        return !!g.image && g.image !== prev
+      }).length
+      if (done >= ffGroups.value.length || tries >= 40) {
+        window.clearInterval(timer)
+        ffGenBusy.value = false
+        ffBusyIds.value = []
+        const finished = ffGroups.value.filter((g: any) => !!g.image).length
+        if (finished > 0) toast.success(`首帧图完成 ${finished}/${ffGroups.value.length}`)
+        else toast.warning('首帧图还在生成，稍后刷新查看')
+      }
+    }, 5000)
+  } catch (e: any) {
+    ffGenBusy.value = false
+    ffBusyIds.value = []
+    toast.error('生成失败', e.response?.data?.message || e.message)
+  }
+}
+
+/** 改一组的构图描述（景别写不准时手工修一句，比重新规划省事） */
+const saveGroupDesc = async (g: any) => {
+  try {
+    await api.put(`/firstframes/${g.id}`, { description: g.description })
+    toast.success('已保存构图描述')
+  } catch (e: any) {
+    toast.error('保存失败', e.response?.data?.message || e.message)
+  }
+}
+
+// ---------- 分镜表（整集每一镜的时间轴 / 台词 / 字数 / 语速） ----------
+const shotSheetOpen = ref(false)
+
+/**
+ * 把描述词拆成镜头列表。
+ *
+ * 现在后端输出的是「镜号：1 / 景别：中景/老师 / 运镜：固定镜头 /
+ * 情绪动作：… / 台词：老师：… / 音效：… / 时长：2s」这种分段写法；
+ * 库里还有老数据是「｜镜头1｜ 0–2秒｜中景｜固定机位｜」，
+ * 两种都要能读，分镜表和镜头拆解才不会因为换格式就空掉。
+ */
+const parseFrameShots = (vp: string) => {
+  const shots: any[] = []
+  const text = vp || ''
+
+  // ---------- H3 结构：【Shot 1｜0–3秒｜双人中景·@老师】+ 五个子项 ----------
+  const h3: any[] = []
+  let h3cur: any = null
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    // 官方时间轴写法：[Shot 1] 0.00–3.00s，双人中景，主体 @老师
+    // 兼容上一版：【Shot 1｜0–3秒｜双人中景·@老师】
+    const m =
+      line.match(/^\[Shot\s*(\d+)\]\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*s[，,]\s*([^，,]*)/) ||
+      line.match(/^【Shot\s*(\d+)｜\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*秒｜\s*([^】]*)】$/)
+    if (m) {
+      if (h3cur) h3.push(h3cur)
+      const start = parseFloat(m[2])
+      const end = parseFloat(m[3])
+      // 「双人中景·@老师」→ 景别只取「·」前那半
+      let size = (m[4] || '').trim()
+      if (size.includes('·')) size = size.split('·')[0].trim()
+      h3cur = {
+        no: parseInt(m[1], 10) || h3.length + 1,
+        start,
+        end,
+        dur: Math.max(0, end - start),
+        size,
+        camera: '',
+        line: '',
+        action: '',
+        chars: 0,
+        rate: 0
+      }
+      continue
+    }
+    if (!h3cur) continue
+    if (line.startsWith('【主体】')) {
+      h3cur.action = line.slice('【主体】'.length).trim()
+    } else if (line.startsWith('【动作】')) {
+      const v = line.slice('【动作】'.length).trim()
+      h3cur.action = h3cur.action ? h3cur.action + '；' + v : v
+    } else if (line.startsWith('【镜头】')) {
+      h3cur.camera = line.slice('【镜头】'.length).trim()
+    } else {
+      // 台词行：(S2) @老师 <d>[中文] 正文</d>
+      const dm = line.match(/<d>\s*(?:\[[^\]]*\]\s*)?([\s\S]*?)\s*<\/d>/)
+      if (dm) {
+        const body = dm[1].trim()
+        if (body) h3cur.line = h3cur.line ? h3cur.line + ' ' + body : body
+      }
+    }
+  }
+  if (h3cur) h3.push(h3cur)
+
+  if (h3.length) {
+    for (const sh of h3) {
+      const chars = (sh.line.match(/[\u4e00-\u9fa5A-Za-z0-9]/g) || []).length
+      const pauses = (sh.line.match(/——|—{2,}|-{2,}/g) || []).length
+      const speak = Math.max(0, sh.dur - pauses * 0.8)
+      sh.chars = chars
+      sh.rate = speak > 0 && chars > 0 ? chars / speak : 0
+    }
+    return h3
+  }
+
+  // ---------- 上一版平铺格式（镜号/景别/运镜/情绪动作/台词/音效/时长） ----------
+  let cur: any = null
+  let cursor = 0
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line) continue
+    if (line.startsWith('镜号：')) {
+      if (cur) shots.push(cur)
+      const no = parseInt(line.replace('镜号：', ''), 10)
+      cur = {
+        no: Number.isFinite(no) ? no : shots.length + 1,
+        start: cursor,
+        end: cursor,
+        dur: 0,
+        size: '',
+        camera: '',
+        line: '',
+        action: '',
+        chars: 0,
+        rate: 0
+      }
+      continue
+    }
+    if (!cur) continue
+    if (line.startsWith('景别：')) {
+      const v = line.slice(3).trim()
+      cur.size = v.includes('/') ? v.split('/')[0] : v
+    } else if (line.startsWith('运镜：')) {
+      cur.camera = line.slice(3).trim()
+    } else if (line.startsWith('情绪/动作：')) {
+      cur.action = line.slice('情绪/动作：'.length).trim()
+    } else if (line.startsWith('台词：')) {
+      const v = line.slice(3).trim()
+      if (v && v !== '无') {
+        // 「(S1) @老师：<d>[中文] 坐。</d>」→ 只留台词正文，角色单独存。
+        // H3 的 <d> 标记和 [中文] 语言名不能留在正文里：
+        // 一是界面上会显示成标签，二是字数统计会把「中文」两个字算进语速
+        const idx = v.indexOf('：')
+        let body = idx > 0 ? v.slice(idx + 1) : v
+        body = body
+          .replace(/^<d>\s*(\[[^\]]*\]\s*)?/, '')
+          .replace(/<\/d>\s*$/, '')
+          .trim()
+        if (body) cur.line = cur.line ? cur.line + ' ' + body : body
+      }
+    } else if (line.startsWith('时长：')) {
+      const n = parseInt(line.replace('时长：', ''), 10)
+      if (Number.isFinite(n) && n > 0) cur.dur = n
+    }
+  }
+  if (cur) shots.push(cur)
+
+  if (shots.length) {
+    for (const sh of shots) {
+      sh.start = cursor
+      sh.end = cursor + (sh.dur || 0)
+      cursor = sh.end
+      const chars = (sh.line.match(/[\u4e00-\u9fa5A-Za-z0-9]/g) || []).length
+      const pauses = (sh.line.match(/——|—{2,}|-{2,}/g) || []).length
+      const speak = Math.max(0, sh.dur - pauses * 0.8)
+      sh.chars = chars
+      sh.rate = speak > 0 && chars > 0 ? chars / speak : 0
+    }
+    return shots
+  }
+
+  // ---------- 老格式（｜镜头N｜ 0–2秒｜中景｜固定机位｜） ----------
+  let old: any = null
+  const bodies: string[][] = []
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    const m = line.match(/^｜镜头\s*(\d+)｜\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*秒｜\s*([^｜]*)(?:｜\s*([^｜]*))?/)
+    if (m) {
+      if (old) shots.push(old)
+      old = {
+        no: m[1],
+        start: parseFloat(m[2]),
+        end: parseFloat(m[3]),
+        dur: Math.max(0, parseFloat(m[3]) - parseFloat(m[2])),
+        size: (m[4] || '').trim(),
+        camera: (m[5] || '').trim(),
+        line: '',
+        action: '',
+        chars: 0,
+        rate: 0
+      }
+      bodies.push([])
+      continue
+    }
+    if (old) bodies[bodies.length - 1].push(line)
+  }
+  if (old) shots.push(old)
+
+  return shots.map((sh, i) => {
+    const body = (bodies[i] || []).join('\n')
+    // 台词用贪婪 (.*) 取到行末最后一个 ”：台词内部可能还有引号
+    const dl = body.split('\n').map((x) => x.trim()).find((x) => x.includes('台词】'))
+    const line = dl ? (/：“(.*)”/.exec(dl)?.[1] || '').trim() : ''
+    let action = ''
+    const ai = body.indexOf('【动作】')
+    if (ai >= 0) {
+      for (const raw of body.slice(ai + 4).split('\n')) {
+        const t = raw.trim().replace(/^（[^）]*）/, '').trim()
+        if (t && !t.startsWith('【')) {
+          action = t
+          break
+        }
+      }
+    } else {
+      action = body.split('\n').map((x) => x.trim()).find((x) => x && !x.startsWith('【') && !x.startsWith('｜')) || ''
+    }
+    const chars = (line.match(/[\u4e00-\u9fa5A-Za-z0-9]/g) || []).length
+    const pauses = (line.match(/——|—{2,}|-{2,}/g) || []).length
+    const speak = Math.max(0, sh.dur - pauses * 0.8)
+    return { ...sh, line, action, chars, rate: speak > 0 && chars > 0 ? chars / speak : 0 }
+  })
+}
+
+const shotSheetRows = computed(() => {
+  const rows: any[] = []
+  frames.value.forEach((f: any, fi: number) => {
+    const shots = parseFrameShots(f.videoPrompt || '')
+    const frameNo = f.frameIndex || fi + 1
+    if (!shots.length) {
+      rows.push({ frame: frameNo, no: '—', start: 0, end: 0, dur: Number(f.duration) || 0, size: '', camera: '', line: '', action: '', chars: 0, rate: 0 })
+      return
+    }
+    shots.forEach((sh) => rows.push({ frame: frameNo, ...sh }))
+  })
+  return rows
+})
+
+/** 语速异常的行（> 5 字/秒 基本念不完，会导致截断/口型错位） */
+const slowRows = computed(() => shotSheetRows.value.filter((r) => r.rate > 5).length)
+
+const gotoFrame = (frameNo: number) => {
+  const i = frames.value.findIndex((f: any, idx: number) => (f.frameIndex || idx + 1) === frameNo)
+  if (i >= 0) {
+    activeFrame.value = i
+    shotSheetOpen.value = false
+  }
+}
+
+// ---------- 其它 ----------
+const frameShots = computed(() => parseFrameShots(activeFrameData.value?.videoPrompt || ''))
+const frameStatus = (f: any) => taskOf(f.id)?.status || ''
+const back = () => router.push('/projects')
+
+/**
+ * 某一步能不能点进去。
+ * 只按「走过的最远一步」会锁死：从分镜回退到剧本后，成片那格就再也点不动了
+ * （maxStep 还停在 2）。有分镜就等于分镜/成片都已解锁。
+ */
+const canGoStep = (i: number) => i <= maxStep.value || (i >= 2 && frames.value.length > 0)
+
+/** 面包屑里切集：换集要重新拉资产、分镜、首帧分组 */
+const switchEpisode = async () => {
+  const ep = episodes.value.find((e) => e.id === episodeId.value)
+  if (!ep) return
+  curEpisode.value = ep
+  script.value = ep.scriptText || ''
+  applyEpisodeConfig(ep)
+  activeFrame.value = 0
+  ffGroups.value = []
+  await Promise.all([loadAssets(), loadFrames(), loadFirstFrameGroups()])
+  step.value = frames.value.length > 0 ? 2 : assets.value.characters.length > 0 ? 1 : 0
+}
+
+/** 大图查看时按 Esc 关闭 */
+const onKeydown = (e: KeyboardEvent) => {
+  if (e.key === 'Escape') viewerSrc.value = ''
+}
+
+onMounted(async () => {
+  document.addEventListener('keydown', onKeydown)
+  await loadModels()
+  await load()
+})
+onUnmounted(() => {
+  stopPolling()
+  document.removeEventListener('keydown', onKeydown)
+})
+</script>
+
+<template>
+  <div class="studio">
+    <div v-if="loading" class="loading">加载中…</div>
+
+    <template v-else-if="project">
+      <!-- 顶部：返回胶囊 + 面包屑（首页 › 我的项目 › 项目 › 第N集） -->
+      <div class="top-bar">
+        <button class="back" @click="back">
+          <svg viewBox="0 0 24 24" fill="none" width="14" height="14">
+            <path d="M15 6l-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          返回
+        </button>
+        <span class="tb-sep"></span>
+        <nav class="crumbs">
+          <a class="crumb home" @click="router.push('/')">
+            <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+              <path d="M4 10.5 12 4l8 6.5V19a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19v-8.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+            </svg>
+            首页
+          </a>
+          <span class="crumb-sep">›</span>
+          <a class="crumb" @click="router.push('/projects')">我的项目</a>
+          <span class="crumb-sep">›</span>
+          <a class="crumb" @click="router.push(`/projects/${projectId}`)">{{ project.name }}</a>
+          <span class="crumb-sep">›</span>
+          <select
+            v-if="episodes.length > 1"
+            v-model="episodeId"
+            class="crumb-sel"
+            @change="switchEpisode"
+          >
+            <option v-for="e in episodes" :key="e.id" :value="e.id">
+              第 {{ e.episodeNumber }} 集{{ e.title && !/第\s*\d+\s*集/.test(e.title) ? '：' + e.title : '' }}
+            </option>
+          </select>
+          <span v-else class="crumb on">{{ episodeCrumb || '未命名剧集' }}</span>
+        </nav>
+      </div>
+
+      <!-- 步骤条 -->
+      <div class="stepper">
+        <div
+          v-for="(s, i) in [
+            { key: 'script', label: '剧本', desc: '写或粘贴你的故事' },
+            { key: 'assets', label: '资产', desc: '角色场景道具' },
+            { key: 'storyboard', label: '分镜', desc: '镜头与描述词' },
+            { key: 'video', label: '成片', desc: '批量生成视频' }
+          ]"
+          :key="s.key"
+          class="step"
+          :class="{ on: i === step, done: i < step, locked: !canGoStep(i) }"
+          @click="canGoStep(i) && (step = i)"
+        >
+          <div class="step-dot">
+            <svg v-if="i < step" viewBox="0 0 24 24" fill="none" width="12" height="12">
+              <path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span v-else>{{ i + 1 }}</span>
+          </div>
+          <div class="step-text">
+            <span class="step-label">{{ s.label }}</span>
+            <span class="step-desc">{{ s.desc }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 步骤 0：剧本 ===== -->
+      <div v-if="step === 0" class="panel rise">
+        <div class="panel-head">
+          <h2>写下你的故事</h2>
+          <p>建议包含「场景：」「人物：」「道具：」标记，识别更准</p>
+        </div>
+
+        <div class="editor">
+          <div class="editor-bar">
+            <div class="dots"><i></i><i></i><i></i></div>
+            <span class="editor-file">script.txt</span>
+            <span class="editor-count">{{ script.length }} 字</span>
+          </div>
+          <textarea
+            v-model="script"
+            class="editor-body"
+            placeholder="场景：咨询间 - 白天
+人物：生涯规划老师、高中学生
+道具：专业介绍册
+
+老师：坐。你说对土木有兴趣，又怕“就是去工地”。先说说你印象里的土木是什么？
+学生：盖房子、修路架桥吧，听说毕业常驻工地。"
+          ></textarea>
+        </div>
+
+        <div class="panel-foot">
+          <span class="foot-hint">
+            <template v-if="script.length < 50">建议 50 字以上，AI 识别更准</template>
+            <template v-else>剧本就绪，可以识别资产了</template>
+          </span>
+          <div class="foot-actions">
+            <button class="btn btn-ghost" :disabled="savingScript" @click="saveScript">
+              {{ savingScript ? '保存中' : '保存草稿' }}
+            </button>
+            <button class="btn btn-primary" :disabled="!script.trim() || identifying" @click="identify">
+              <span v-if="identifying" class="spinner"></span>
+              {{ identifying ? '识别中' : '识别角色与场景' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 步骤 1：资产 ===== -->
+      <div v-else-if="step === 1" class="panel rise">
+        <div class="panel-head">
+          <div class="ph-row">
+            <div>
+              <h2>识别到的资产</h2>
+              <p>这些是后续所有镜头的形象锚点，确认无误后继续</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 生成配置工具栏：与竞品同构，先定好出图规格再批量 -->
+        <div class="gen-toolbar">
+          <div class="gt-left">
+            <PillSelect v-model="genOpts.modelId" label="模型" :options="modelOptions" :width="148" />
+            <span class="gt-sep"></span>
+            <PillSelect v-model="genOpts.resolution" label="分辨率" :options="RES_OPTIONS" />
+            <span class="gt-sep"></span>
+            <PillSelect
+              v-model="genOpts.charStyle"
+              label="角色样式"
+              :options="CHAR_STYLE_OPTIONS"
+              :width="104"
+              previewable
+            >
+              <template #preview="{ option }">
+                <CharStylePreview :style="option.value" :title="option.label" :desc="option.hint" />
+              </template>
+            </PillSelect>
+            <PillSelect
+              v-model="genOpts.sceneStyle"
+              label="场景样式"
+              :options="SCENE_STYLE_OPTIONS"
+              :width="116"
+              previewable
+            >
+              <template #preview="{ option }">
+                <SceneStylePreview
+                  :style="option.value"
+                  :vertical="scriptStyle.vertical"
+                  :title="option.label"
+                  :desc="option.hint"
+                />
+              </template>
+            </PillSelect>
+            <span class="gt-sep"></span>
+            <PillToggle
+              v-model="genOpts.showName"
+              label="角色名"
+              hint="开启后，仅角色参考图左上角显示角色名称，场景与道具图不显示"
+            />
+          </div>
+          <div class="gt-right">
+            <button
+              class="btn btn-ghost btn-sm"
+              :disabled="batchRunning || missingImages === 0"
+              @click="batchGenerateImages"
+            >
+              <span v-if="batchRunning" class="spinner"></span>
+              <svg v-else viewBox="0 0 24 24" fill="none" width="14" height="14">
+                <rect x="3" y="4" width="18" height="16" rx="2.5" stroke="currentColor" stroke-width="1.7" />
+                <circle cx="8.5" cy="9.5" r="1.6" fill="currentColor" />
+                <path d="m4 17 5-4.5 4 3.5 3-2.5 4 3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              {{ batchRunning ? '生成中' : missingImages > 0 ? `生成参考图（${missingImages}）` : '参考图已齐' }}
+            </button>
+            <button class="btn btn-primary btn-sm" :disabled="generating" @click="generateStoryboard">
+              <span v-if="generating" class="spinner"></span>
+              {{ generating ? '生成中' : '下一步：生成分镜' }}
+            </button>
+          </div>
+        </div>
+
+        <div class="asset-wrap">
+          <div class="asset-cols">
+          <div v-for="sec in assetSections" :key="sec.key" class="asset-section">
+            <div class="asset-title">
+              <span class="dot" :class="sec.cls"></span>{{ sec.label }}
+              <span class="count">{{ sec.list.length }}</span>
+              <span class="sec-ratio">{{ ratioOf(sec.type) }}</span>
+            </div>
+
+            <div v-if="sec.list.length" class="asset-grid">
+              <div v-for="a in sec.list" :key="a.id" class="asset-card">
+                <div class="asset-thumb" :class="sec.thumbCls">
+                  <img
+                    v-if="a.referenceImage"
+                    :src="a.referenceImage"
+                    :alt="a.name"
+                    @click="viewImage(a.referenceImage)"
+                  />
+                  <template v-else>{{ a.name?.[0] }}</template>
+                  <span v-if="sec.type === 'character' && genOpts.showName" class="thumb-name">{{ a.name }}</span>
+                  <div v-if="isTaskRunning(taskOf(a.id))" class="thumb-mask">
+                    <span class="spinner"></span>
+                  </div>
+                </div>
+                <div class="asset-body">
+                  <div class="ab-head">
+                    <h4>
+                      <span class="an">{{ a.name }}</span>
+                      <span v-if="a.timeOfDay || a.category" class="tod">{{ a.timeOfDay || a.category }}</span>
+                    </h4>
+                  </div>
+                  <p class="asset-prompt">{{ a[sec.desc] || a.identityAnchor || a.spatialAnchor || a.prompt }}</p>
+                  <div class="ab-acts">
+                    <button class="regen-main" @click="regenAssetImage(sec.type, a.id)">
+                      <svg viewBox="0 0 24 24" fill="none" width="11" height="11">
+                        <path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                        <path d="M18 3v4h-4M6 21v-4h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                      重新生成
+                    </button>
+                    <button class="icon-btn" title="编辑" @click="openEdit(sec.type, a)">
+                      <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                        <path d="M4 20h4l10-10-4-4L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                    <button class="icon-btn danger" title="删除" @click="removeAsset(sec.type, a)">
+                      <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                        <path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-else class="asset-empty">{{ sec.empty }}</div>
+          </div>
+          </div>
+        </div>
+
+        <div class="panel-foot">
+          <span class="foot-hint">
+            {{ missingImages > 0 ? `还有 ${missingImages} 个资产没出图` : '资产已齐，可以生成分镜' }}
+          </span>
+          <div class="foot-actions">
+            <button class="btn btn-ghost" @click="step = 0">上一步</button>
+            <button class="btn btn-ghost" :disabled="identifying" @click="identify">重新识别</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 步骤 2：分镜工作台 ===== -->
+      <div v-else-if="step === 2" class="sb-wrap rise">
+        <!-- 工具栏 -->
+        <div class="sb-bar">
+          <div class="sb-left">
+            <PillSelect v-model="sbDuration" label="时长" :options="DURATION_OPTIONS" />
+            <PillSelect v-model="sbRatio" label="画幅" :options="RATIO_OPTIONS" />
+            <PillSelect
+              v-if="videoModelOptions.length"
+              v-model="videoModel"
+              label="视频模型"
+              :options="videoModelOptions"
+              :width="200"
+            />
+          </div>
+          <div class="sb-right">
+            <button class="sb-btn" :disabled="!frames.length" @click="shotSheetOpen = true">分镜表</button>
+            <button class="sb-btn" :disabled="ffPlanning || !frames.length" @click="planFirstFrames">
+              {{ ffPlanning ? '规划中…' : '首帧规划' }}
+            </button>
+            <button
+              class="sb-btn"
+              :disabled="!ffGroups.length || ffGenBusy"
+              title="查看已生成的首帧参考图"
+              @click="openFirstFramePanel"
+            >
+              <span v-if="ffGenBusy" class="spinner"></span>
+              {{ ffGenBusy ? '首帧生成中…' : `首帧图（${ffGroups.filter((g: any) => g.image).length}/${ffGroups.length}）` }}
+            </button>
+            <button class="sb-btn" :disabled="generating" @click="generateStoryboard">
+              {{ generating ? '生成中…' : '重新生成' }}
+            </button>
+            <button
+              class="sb-btn primary"
+              :disabled="generatingVideo || !pendingVideoCount"
+              @click="generateVideos"
+            >
+              <span v-if="generatingVideo" class="spinner"></span>
+              {{ generatingVideo ? '提交中…' : `批量视频（${pendingVideoCount}）` }}
+            </button>
+          </div>
+        </div>
+
+        <div class="workbench">
+          <!-- 左：镜头列表 -->
+          <div class="wb-col frames-col">
+            <div class="wb-head">
+              <span>分镜</span>
+              <span class="wb-count">{{ frames.length }}</span>
+            </div>
+            <div class="frames-scroll">
+              <div
+                v-for="(f, i) in frames"
+                :key="f.id"
+                class="frame-mini"
+                :class="{ on: i === activeFrame }"
+                @click="activeFrame = i"
+              >
+                <span class="fm-idx">{{ String(f.frameIndex || i + 1).padStart(2, '0') }}</span>
+                <div class="fm-body">
+                  <p>{{ (f.text || '').split('\n').filter((x: string) => x.trim()).slice(0, 2).join(' ').slice(0, 46) }}</p>
+                  <div class="fm-tags">
+                    <span class="mini-tag dur">{{ Math.round(Number(f.duration) || 0) }}s</span>
+                    <span class="mini-tag">{{ parseFrameShots(f.videoPrompt || '').length }} 镜</span>
+                    <span v-if="f.videoUrl" class="mini-tag ok">已出片</span>
+                    <span v-else-if="isTaskRunning(taskOf(f.id))" class="mini-tag busy">生成中</span>
+                  </div>
+                </div>
+                <img
+                  v-if="ffGroupOfFrame(f.frameIndex || i + 1)?.image"
+                  class="fm-thumb"
+                  :src="ffGroupOfFrame(f.frameIndex || i + 1)?.image || ''"
+                  alt=""
+                />
+              </div>
+            </div>
+          </div>
+
+          <!-- 中：当前分镜 -->
+          <div class="wb-col main-col">
+            <template v-if="activeFrameData">
+              <div class="fd-head">
+                <div class="fd-title">
+                  第 {{ activeFrameData.frameIndex }} 段
+                  <span class="fd-meta">{{ Math.round(Number(activeFrameData.duration) || 0) }} 秒 · {{ frameShots.length }} 个镜头</span>
+                </div>
+                <div class="fd-acts">
+                  <button class="btn btn-ghost btn-sm" @click="regenerateFrame">重生成</button>
+                  <button class="btn btn-ghost btn-sm" :disabled="isTaskRunning(taskOf(activeFrameData.id))" @click="saveFrame">保存</button>
+                  <button
+                    class="btn btn-primary btn-sm"
+                    :disabled="isTaskRunning(taskOf(activeFrameData.id))"
+                    @click="generateOneVideo(activeFrameData)"
+                  >
+                    {{ activeFrameData.videoUrl ? '重出本段' : '出本段视频' }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="main-inner" :class="{ 'with-media': hasMedia, 'with-shots': frameShots.length > 0 }">
+                <!-- 左：画面（视频 / 生成中 / 场景全景参考） -->
+                <div v-if="hasMedia" class="fd-media">
+                  <div v-if="activeFrameData.videoUrl" class="fd-video">
+                    <video :src="activeFrameData.videoUrl" controls playsinline></video>
+                  </div>
+                  <div v-else-if="isTaskRunning(taskOf(activeFrameData.id))" class="fd-busy">
+                    <span class="spinner"></span>
+                    <span>生成中 {{ taskOf(activeFrameData.id)?.progress || 0 }}%</span>
+                  </div>
+
+                  <div v-if="activeGroup?.image || ffRefreshing" class="fd-ff">
+                    <div class="fd-ff-head">
+                      <span>场景全景参考</span>
+                      <span class="fd-ff-note">{{ ffRefreshing ? '正在生成…' : coverText(activeGroup) }}</span>
+                      <button
+                        v-if="activeGroup?.image"
+                        class="fd-ff-zoom"
+                        title="放大查看"
+                        @click="viewImage(activeGroup.image)"
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                          <path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                      </button>
+                    </div>
+                    <div class="fd-ff-body" :class="{ busy: ffRefreshing }">
+                      <img
+                        v-if="activeGroup?.image"
+                        :src="activeGroup.image"
+                        alt=""
+                        class="zoomable"
+                        @click="viewImage(activeGroup.image)"
+                      />
+                      <div v-else class="fd-ff-empty">首次生成中，稍等…</div>
+                      <div v-if="ffRefreshing" class="fd-ff-mask">
+                        <span class="spinner"></span>
+                        <span>正在生成新的参考图</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 右：文字（文案 / 描述词 / 镜头拆解） -->
+                <div class="fd-text">
+                  <div class="prompt-block">
+                    <div class="pb-head"><span>文案</span><span class="pb-badge">text</span></div>
+                    <textarea v-model="activeFrameData.text" class="fd-textarea short"></textarea>
+                  </div>
+
+                  <div class="prompt-block">
+                    <div class="pb-head">
+                      <span>视频描述词</span>
+                      <span class="pb-badge">video_prompt</span>
+                    </div>
+                    <textarea v-model="activeFrameData.videoPrompt" class="fd-textarea"></textarea>
+                  </div>
+
+                </div>
+
+                <!-- 第三栏：镜头拆解（只读，和文案分开看更清楚） -->
+                <div v-if="frameShots.length" class="fd-shots">
+                  <div class="fd-shots-head">镜头拆解</div>
+                  <div v-for="sh in frameShots" :key="sh.no" class="fd-shot">
+                    <div class="fd-shot-top">
+                      <span class="fd-shot-no">{{ sh.no }}</span>
+                      <span class="fd-shot-time">{{ sh.start }}–{{ sh.end }}s</span>
+                      <span class="fd-shot-size">{{ sh.size }}</span>
+                      <span v-if="sh.camera" class="fd-shot-cam">{{ sh.camera }}</span>
+                      <span v-if="sh.rate > 5" class="fd-shot-warn">{{ sh.rate.toFixed(1) }} 字/秒 偏快</span>
+                    </div>
+                    <p v-if="sh.line" class="fd-shot-line">“{{ sh.line }}”</p>
+                    <p v-if="sh.action" class="fd-shot-act">{{ sh.action }}</p>
+                  </div>
+                </div>
+              </div>
+            </template>
+            <div v-else class="wb-empty">还没有分镜</div>
+          </div>
+
+          <!-- 右：资产速查 -->
+          <div class="wb-col side-col">
+            <div class="wb-head"><span>资产</span></div>
+            <div class="side-scroll">
+              <div class="side-group">
+                <div class="sg-title"><span class="dot role"></span>角色</div>
+                <div v-for="c in assets.characters" :key="c.id" class="side-item">
+                  <img v-if="c.referenceImage" class="si-thumb" :src="c.referenceImage" alt="" />
+                  <div class="si-body">
+                    <span class="si-name">@{{ c.name }}</span>
+                    <span class="si-desc">{{ c.identityAnchor }}</span>
+                  </div>
+                </div>
+                <div v-if="!assets.characters.length" class="side-empty">无</div>
+              </div>
+              <div class="side-group">
+                <div class="sg-title"><span class="dot scene"></span>场景</div>
+                <div v-for="s in assets.scenes" :key="s.id" class="side-item">
+                  <img v-if="s.referenceImage" class="si-thumb" :src="s.referenceImage" alt="" />
+                  <div class="si-body">
+                    <span class="si-name">@{{ s.name }}</span>
+                    <span class="si-desc">{{ s.spatialAnchor }}</span>
+                  </div>
+                </div>
+                <div v-if="!assets.scenes.length" class="side-empty">无</div>
+              </div>
+              <div class="side-group">
+                <div class="sg-title"><span class="dot item"></span>道具</div>
+                <div v-for="it in assets.items" :key="it.id" class="side-item">
+                  <img v-if="it.referenceImage" class="si-thumb" :src="it.referenceImage" alt="" />
+                  <div class="si-body">
+                    <span class="si-name">@{{ it.name }}</span>
+                    <span class="si-desc">{{ it.prompt }}</span>
+                  </div>
+                </div>
+                <div v-if="!assets.items.length" class="side-empty">无</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 底部 -->
+          <div class="wb-foot">
+            <div class="wf-left">
+              <span class="wf-stat">{{ frames.length }} 段 · 约 {{ totalDuration }} 秒 · 已出片 {{ doneVideoCount }}</span>
+            </div>
+            <div class="wf-right">
+              <button class="btn btn-ghost btn-sm" @click="step = 1">上一步</button>
+              <button class="btn btn-primary btn-sm" @click="step = 3">下一步：成片</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== 步骤 3：成片 ===== -->
+      <div v-else class="panel rise">
+        <div class="panel-head">
+          <div class="ph-row">
+            <div>
+              <h2>生成成片</h2>
+              <p>{{ frames.length }} 段，共 {{ totalDuration }} 秒 · 每段按自己的时长单独生成</p>
+            </div>
+            <button class="btn btn-primary btn-sm" :disabled="generatingVideo || !pendingVideoCount" @click="generateVideos">
+              <span v-if="generatingVideo" class="spinner"></span>
+              {{ generatingVideo ? '提交中…' : pendingVideoCount ? `生成剩余 ${pendingVideoCount} 段` : '已全部出片' }}
+            </button>
+          </div>
+        </div>
+
+        <div class="video-body">
+          <div class="vsummary">
+            <div class="vs-item">
+              <span class="vs-label">段数</span>
+              <span class="vs-value">{{ frames.length }}</span>
+            </div>
+            <div class="vs-item">
+              <span class="vs-label">总时长</span>
+              <span class="vs-value">{{ totalDuration }}s</span>
+            </div>
+            <div class="vs-item">
+              <span class="vs-label">已出片</span>
+              <span class="vs-value done">{{ doneVideoCount }} / {{ frames.length }}</span>
+            </div>
+            <div class="vs-item">
+              <span class="vs-label">画幅</span>
+              <span class="vs-value">{{ sbRatio }}</span>
+            </div>
+          </div>
+
+          <div class="vlist">
+            <div v-for="(f, i) in frames" :key="f.id" class="vitem" :class="{ empty: !f.videoUrl }">
+              <div class="vitem-head">
+                <span class="vitem-no">第 {{ f.frameIndex }} 段</span>
+                <span class="vitem-dur">{{ Math.round(Number(f.duration) || 0) }}s</span>
+                <button class="vitem-go" @click="activeFrame = i; step = 2">编辑</button>
+              </div>
+              <video v-if="f.videoUrl" :src="f.videoUrl" controls playsinline preload="metadata"></video>
+              <div v-else class="vitem-empty">
+                <span v-if="isTaskRunning(taskOf(f.id))">生成中 {{ taskOf(f.id)?.progress || 0 }}%</span>
+                <button v-else class="btn btn-ghost btn-sm" @click="generateOneVideo(f)">出这一段</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-foot">
+          <span class="foot-hint">
+            {{ generatingVideo ? '正在提交，可在此页等待' : pendingVideoCount === 0 ? '全部分镜已出片' : '生成后可单段重抽，无需整片重跑' }}
+          </span>
+          <div class="foot-actions">
+            <button class="btn btn-ghost" @click="step = 2">上一步</button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ===== 编辑资产弹窗（角色 / 场景 / 道具） ===== -->
+    <Teleport to="body">
+      <div v-if="editOpen" class="mask" @click.self="editOpen = false">
+        <div class="modal">
+          <header class="modal-head">
+            <div>
+              <h3>编辑{{ editType === 'character' ? '角色' : editType === 'scene' ? '场景' : '道具' }}</h3>
+              <span class="modal-sub">改名称与出图提示词后点保存，再重新生成才会生效</span>
+            </div>
+            <button class="modal-x" @click="editOpen = false">×</button>
+          </header>
+
+          <div class="modal-body">
+            <div class="ed-row">
+              <div class="ed-ref">
+                <div class="ed-ref-thumb">
+                  <img v-if="editForm.referenceImage" :src="editForm.referenceImage" alt="" />
+                  <span v-else>暂无参考图</span>
+                </div>
+                <label class="ed-upload">
+                  <input type="file" accept="image/*" hidden @change="uploadRef" />
+                  <span v-if="uploading">上传中…</span>
+                  <span v-else>{{ editForm.referenceImage ? '更换参考图' : '上传参考图' }}</span>
+                </label>
+              </div>
+
+              <div class="ed-fields">
+                <label class="ed-field">
+                  <span>名称</span>
+                  <input v-model="editForm.name" type="text" placeholder="角色 / 场景 / 道具名" />
+                </label>
+                <label v-if="editType === 'character'" class="ed-field">
+                  <span>音色描述</span>
+                  <input v-model="editForm.voiceTone" type="text" placeholder="如：沉稳中年女音，中低音域，语速中等偏慢" />
+                </label>
+              </div>
+            </div>
+
+            <label class="ed-field block">
+              <span>出图提示词</span>
+              <textarea v-model="editForm.imagePrompt" rows="8" class="ed-textarea"></textarea>
+            </label>
+          </div>
+
+          <footer class="modal-foot">
+            <span class="modal-tip">提示词只影响这张参考图，不改变分镜描述词</span>
+            <button class="btn btn-ghost btn-sm" @click="editOpen = false">取消</button>
+            <button class="btn btn-primary btn-sm" :disabled="editSaving" @click="saveAsset">
+              {{ editSaving ? '保存中…' : '保存' }}
+            </button>
+          </footer>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- ===== 资产大图查看 ===== -->
+    <Teleport to="body">
+      <div v-if="viewerSrc" class="viewer-mask" @click.self="viewerSrc = ''">
+        <button class="viewer-x" @click="viewerSrc = ''">×</button>
+        <img :src="viewerSrc" alt="" />
+      </div>
+    </Teleport>
+
+    <!-- ===== 首帧规划弹窗 ===== -->
+    <Teleport to="body">
+      <div v-if="ffPlanOpen" class="mask" @click.self="ffPlanOpen = false">
+        <div class="modal">
+          <header class="modal-head">
+            <div>
+              <h3>首帧规划</h3>
+              <span class="modal-sub">
+                <template v-if="ffGenBusy">
+                  <span class="ff-busy-dot"></span>正在生成 {{ ffBusyIds.length }} 张，通常 30–60 秒，生成完自动更新
+                </template>
+                <template v-else>
+                  共 {{ ffGroups.length }} 组 · 同场景共用一张全景参考图，镜头由视频模型自己切
+                </template>
+              </span>
+            </div>
+            <button class="modal-x" @click="ffPlanOpen = false">×</button>
+          </header>
+
+          <div class="modal-body">
+            <div v-for="(g, i) in ffGroups" :key="g.id" class="ffg">
+              <div class="ffg-thumb" :class="{ busy: isFfBusy(g) }">
+                <img v-if="g.image" :src="g.image" alt="" class="zoomable" @click="viewImage(g.image)" />
+                <span v-else>未生成</span>
+                <div v-if="isFfBusy(g)" class="ffg-mask">
+                  <span class="spinner"></span>
+                  <span class="ffg-mask-t">生成中</span>
+                </div>
+              </div>
+              <div class="ffg-body">
+                <div class="ffg-title">
+                  第 {{ i + 1 }} 组 · {{ g.sceneName || '未命名场景' }}
+                  <span class="ffg-count">{{ parseIdx(g.frameIndexes).length }} 段</span>
+                </div>
+                <textarea v-model="g.description" class="ffg-desc" rows="3"></textarea>
+                <div class="ffg-foot">
+                  <span class="ffg-frames">覆盖：{{ parseIdx(g.frameIndexes).join('、') }}</span>
+                  <button class="link-btn" @click="saveGroupDesc(g)">保存描述</button>
+                </div>
+              </div>
+            </div>
+            <div v-if="!ffGroups.length" class="modal-empty">还没有规划结果</div>
+          </div>
+
+          <footer class="modal-foot">
+            <span class="modal-tip">描述里只写空间与人物，不写景别和运镜</span>
+            <button class="btn btn-ghost btn-sm" :disabled="ffGenBusy" @click="planFirstFrames">重新规划</button>
+            <button class="btn btn-primary btn-sm" :disabled="ffGenBusy || !ffGroups.length" @click="genFirstFrameGroups">
+              <span v-if="ffGenBusy" class="spinner"></span>
+              {{ ffGenBusy ? '生成中…' : `生成 ${ffGroups.length} 张` }}
+            </button>
+          </footer>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- ===== 分镜表弹窗 ===== -->
+    <Teleport to="body">
+      <div v-if="shotSheetOpen" class="mask" @click.self="shotSheetOpen = false">
+        <div class="modal wide">
+          <header class="modal-head">
+            <div>
+              <h3>分镜表</h3>
+              <span class="modal-sub">
+                共 {{ shotSheetRows.length }} 个镜头 ·
+                <span :class="{ warn: slowRows > 0 }">{{ slowRows }} 处语速偏快</span>
+                （超过 5 字/秒容易被截断）
+              </span>
+            </div>
+            <button class="modal-x" @click="shotSheetOpen = false">×</button>
+          </header>
+
+          <div class="modal-body">
+            <table class="sheet">
+              <thead>
+                <tr>
+                  <th>段</th>
+                  <th>镜</th>
+                  <th>时间轴</th>
+                  <th>景别</th>
+                  <th>台词</th>
+                  <th>字数</th>
+                  <th>语速</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(r, i) in shotSheetRows" :key="i" @click="gotoFrame(r.frame)">
+                  <td class="dim">{{ r.frame }}</td>
+                  <td class="dim">{{ r.no }}</td>
+                  <td class="mono">{{ r.dur ? `${r.start}–${r.end}s` : '—' }}</td>
+                  <td>{{ r.size || '—' }}</td>
+                  <td class="line">{{ r.line || r.action || '—' }}</td>
+                  <td class="dim">{{ r.chars || '—' }}</td>
+                  <td :class="r.rate > 5 ? 'bad' : r.rate > 0 ? 'ok' : 'dim'">
+                    {{ r.rate ? r.rate.toFixed(1) : '—' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <footer class="modal-foot">
+            <span class="modal-tip">点任意一行跳到对应分镜</span>
+            <button class="btn btn-ghost btn-sm" @click="shotSheetOpen = false">关闭</button>
+          </footer>
+        </div>
+      </div>
+    </Teleport>
+  </div>
+</template>
+
+<style scoped>
+.studio { padding-top: 24px; }
+
+.loading { padding: 80px; text-align: center; color: var(--text-mute); font-size: 14px; }
+
+/* 顶部：返回胶囊 + 面包屑 */
+.top-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 12px 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  transition: all 0.2s var(--ease);
+}
+.back:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-hover); }
+.tb-sep { width: 1px; height: 16px; background: var(--border); }
+.crumbs { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-mute); }
+.crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  transition: color 0.2s var(--ease);
+}
+.crumb:hover { color: var(--text); }
+.crumb.on { color: var(--text); font-weight: 550; cursor: default; }
+.crumb-sep { opacity: 0.5; }
+.crumb-sel {
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 550;
+}
+
+/* 步骤条 */
+.stepper {
+  display: flex;
+  align-items: center;
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.step {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.28s var(--ease);
+}
+.step.on, .step.done { opacity: 1; }
+.step.locked { cursor: default; opacity: 0.38; }
+.step-dot {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 11.5px;
+  font-weight: 640;
+  color: var(--text-mute);
+  border: 1.5px solid var(--border-strong);
+  transition: all 0.3s var(--ease);
+}
+.step.on .step-dot {
+  color: #fff;
+  background: var(--grad);
+  border-color: transparent;
+  box-shadow: 0 0 0 4px rgba(124, 92, 255, 0.14);
+}
+.step.done .step-dot {
+  color: var(--accent);
+  border-color: rgba(124, 92, 255, 0.4);
+  background: var(--accent-soft);
+}
+.step-text { display: flex; flex-direction: column; }
+.step-label { font-size: 13.5px; font-weight: 570; }
+.step-desc { font-size: 11.5px; color: var(--text-mute); }
+
+/* 面板 */
+.panel {
+  border-radius: var(--r-xl);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+.panel-head { padding: 20px 24px 16px; border-bottom: 1px solid var(--border); }
+.panel-head h2 { font-size: 16.5px; font-weight: 640; letter-spacing: -0.02em; }
+.panel-head p { font-size: 12.5px; color: var(--text-mute); margin-top: 3px; }
+.ph-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.ph-row .btn { flex-shrink: 0; margin-top: 2px; }
+
+/* 按钮 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 15px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 550;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  transition: all 0.22s var(--ease);
+}
+.btn:hover:not(:disabled) { border-color: var(--border-strong); background: var(--surface-hover); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary {
+  color: #fff;
+  border-color: transparent;
+  background: var(--grad);
+  box-shadow: 0 8px 20px -10px rgba(124, 92, 255, 0.9);
+}
+.btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-ghost { background: transparent; }
+.btn-sm { padding: 6px 12px; font-size: 12.5px; }
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 编辑器 */
+.editor {
+  margin: 20px 24px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  background: var(--bg-soft);
+}
+.editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 13px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+.dots { display: flex; gap: 5px; }
+.dots i { width: 8px; height: 8px; border-radius: 50%; background: rgba(255, 255, 255, 0.13); }
+.editor-file { font-size: 11.5px; color: var(--text-mute); font-family: 'SF Mono', Menlo, monospace; }
+.editor-count { margin-left: auto; font-size: 11px; color: var(--text-mute); }
+.editor-body {
+  width: 100%;
+  min-height: 330px;
+  padding: 16px;
+  font-size: 13.5px;
+  line-height: 1.85;
+  font-family: 'SF Mono', Menlo, 'PingFang SC', monospace;
+  color: var(--text);
+  text-align: left;
+  resize: vertical;
+}
+
+.panel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.015);
+}
+.foot-hint { font-size: 12px; color: var(--text-mute); }
+.foot-actions { display: flex; gap: 9px; }
+
+/* 资产 */
+/* 出图工具栏：一条横条，右侧放「参考图已齐 / 生成分镜」 */
+/* 生成配置工具栏：左边规格、右边动作 */
+.gen-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.012);
+}
+.gt-left { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; }
+/* 工具栏里的下拉整体收一档：1093 宽下要和右侧两个按钮挤在同一行 */
+.gen-toolbar :deep(.pill-group) { gap: 6px; }
+.gen-toolbar :deep(.pill-label) { font-size: 12px; }
+.gen-toolbar :deep(.pill-btn) { height: 30px; padding: 0 8px 0 10px; font-size: 12px; }
+.gt-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.gt-right .btn { padding: 6px 10px; }
+.gt-sep { width: 1px; height: 18px; background: var(--border); margin: 0; }
+
+.asset-wrap { padding: 16px 24px 20px; }
+/* 三段并排：每段一个框，框内卡片网格（对齐参考站：角色 | 场景 | 道具） */
+.asset-cols {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.asset-section {
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.012);
+  padding: 12px;
+  min-height: 120px;
+}
+.asset-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.dot.role { background: #7c5cff; }
+.dot.scene { background: #22d3ee; }
+.dot.item { background: #fbbf24; }
+.count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 99px;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.sec-ratio {
+  margin-left: auto;
+  font-size: 10px;
+  font-family: 'SF Mono', Menlo, monospace;
+  color: var(--text-mute);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+}
+.asset-grid {
+  display: grid;
+  /* 130 起：1093 下每段 308px 正好两列（137），1440 下也是两列（195），
+     道具 4 张始终排 2×2，不会出现 3+1 的断行 */
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.asset-card {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.018);
+  overflow: hidden;
+  transition: all 0.26s var(--ease);
+}
+.asset-card:hover { border-color: var(--border-strong); background: var(--surface-hover); transform: translateY(-2px); }
+
+.asset-thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  display: grid;
+  place-items: center;
+  font-size: 38px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.9);
+  overflow: hidden;
+}
+.asset-thumb.person { background: linear-gradient(150deg, #7c5cff, #4c2fd6); }
+.asset-thumb.scene { background: linear-gradient(150deg, #22d3ee, #0e7490); }
+.asset-thumb.item { background: linear-gradient(150deg, #fbbf24, #d97706); aspect-ratio: 1 / 1; }
+.asset-thumb img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  cursor: zoom-in;
+}
+/* 角色名：只贴在角色参考图左上角，方便一眼对号 */
+.thumb-name {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 2;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #fff;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: rgba(8, 8, 14, 0.62);
+  backdrop-filter: blur(4px);
+}
+.thumb-mask {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 8, 14, 0.7);
+  backdrop-filter: blur(3px);
+}
+
+.asset-body { padding: 8px 9px 9px; min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.ab-head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.ab-head h4 {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 590;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.an {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tod {
+  font-size: 9.5px;
+  font-weight: 450;
+  color: var(--text-mute);
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+.asset-prompt {
+  font-size: 10.5px;
+  color: var(--text-mute);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  flex: 1;
+}
+.ab-acts { display: flex; align-items: center; gap: 4px; margin-top: 8px; }
+.regen-main {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 24px;
+  border-radius: 6px;
+  font-size: 10px;
+  white-space: nowrap;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid transparent;
+  transition: all 0.2s var(--ease);
+}
+.regen-main:hover { color: var(--text); border-color: var(--border-strong); background: rgba(255, 255, 255, 0.09); }
+.icon-btn {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--text-mute);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid transparent;
+  transition: all 0.2s var(--ease);
+}
+.icon-btn:hover { color: var(--text); border-color: var(--border-strong); background: rgba(255, 255, 255, 0.09); }
+.icon-btn.danger:hover { color: var(--err); border-color: rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.1); }
+
+.asset-empty {
+  font-size: 12px;
+  color: var(--text-mute);
+  padding: 14px;
+  border-radius: var(--r-md);
+  border: 1px dashed var(--border);
+  text-align: center;
+}
+
+/* 编辑资产弹窗 */
+.ed-row { display: flex; gap: 16px; padding: 12px 0; }
+.ed-ref { width: 128px; flex-shrink: 0; }
+.ed-ref-thumb {
+  width: 128px;
+  height: 170px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+  display: grid;
+  place-items: center;
+  font-size: 10.5px;
+  color: var(--text-mute);
+}
+.ed-ref-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ed-upload {
+  display: block;
+  margin-top: 8px;
+  height: 28px;
+  line-height: 26px;
+  text-align: center;
+  border-radius: 7px;
+  border: 1px dashed var(--border-strong);
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+}
+.ed-upload:hover { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
+.ed-fields { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.ed-field { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--text-mute); }
+.ed-field.block { padding: 6px 0 14px; }
+.ed-field input,
+.ed-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.ed-textarea { font-family: 'SF Mono', Menlo, 'PingFang SC', monospace; font-size: 11.5px; resize: vertical; }
+
+/* 大图查看 */
+.viewer-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 9200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(4, 4, 9, 0.9);
+  backdrop-filter: blur(6px);
+}
+.viewer-mask img { max-width: 100%; max-height: 100%; border-radius: 10px; display: block; }
+.viewer-x {
+  position: absolute;
+  top: 20px;
+  right: 22px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 20px;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.08);
+}
+.viewer-x:hover { color: var(--text); background: rgba(255, 255, 255, 0.16); }
+
+/* ===== 分镜工作台 ===== */
+.sb-wrap { display: flex; flex-direction: column; gap: 12px; }
+.sb-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+.sb-left, .sb-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sb-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 550;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  transition: all 0.2s var(--ease);
+  white-space: nowrap;
+}
+.sb-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); background: var(--surface-hover); }
+.sb-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.sb-btn.primary {
+  color: #fff;
+  border-color: transparent;
+  background: var(--grad);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sb-btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+
+.workbench {
+  display: grid;
+  grid-template-columns: 220px 1fr 200px;
+  grid-template-rows: 1fr auto;
+  gap: 12px;
+  height: calc(100vh - 350px);
+  min-height: 460px;
+}
+.wb-col {
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.wb-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.wb-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  padding: 1px 7px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.05);
+}
+.frames-scroll { flex: 1; overflow-y: auto; padding: 7px; }
+.frame-mini {
+  display: flex;
+  gap: 9px;
+  padding: 9px 10px;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: all 0.22s var(--ease);
+  border: 1px solid transparent;
+}
+.frame-mini:hover { background: var(--surface-hover); }
+.frame-mini.on { background: var(--accent-soft); border-color: rgba(124, 92, 255, 0.32); }
+.fm-idx { font-size: 10.5px; font-weight: 680; color: var(--accent); flex-shrink: 0; padding-top: 1px; }
+.fm-body { min-width: 0; flex: 1; }
+.fm-body p {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.fm-tags { margin-top: 5px; display: flex; gap: 4px; flex-wrap: wrap; }
+.mini-tag { font-size: 10px; padding: 1px 5px; border-radius: 3px; color: var(--text-mute); background: rgba(255, 255, 255, 0.06); }
+.mini-tag.dur { color: #c4b5fd; background: rgba(124, 92, 255, 0.16); }
+.mini-tag.ok { color: #6ee7b7; background: rgba(16, 185, 129, 0.16); }
+.mini-tag.busy { color: #fcd34d; background: rgba(251, 191, 36, 0.16); }
+.fm-thumb { width: 34px; height: 46px; border-radius: 5px; object-fit: cover; flex-shrink: 0; align-self: center; }
+
+.main-col { min-width: 0; }
+.fd-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.fd-title { font-size: 13px; font-weight: 600; }
+.fd-meta { font-size: 11.5px; font-weight: 450; color: var(--text-mute); margin-left: 8px; }
+.fd-acts { display: flex; gap: 7px; }
+.main-inner {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-content: start;
+}
+/* 有画面时左右分栏：左边看画面、右边改文字，不再上下堆着留大片空白 */
+.main-inner.with-media {
+  grid-template-columns: minmax(200px, 300px) minmax(0, 1fr);
+  align-items: start;
+}
+/* 有镜头拆解时它单独占一栏：文案/描述词一列，拆解一列 */
+.main-inner.with-shots {
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 260px);
+}
+.main-inner.with-media.with-shots {
+  grid-template-columns: minmax(160px, 240px) minmax(0, 1fr) minmax(200px, 260px);
+}
+.fd-media {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  position: sticky;
+  top: 0;
+}
+.fd-text { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+.fd-video { border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); background: #000; }
+.fd-video video { width: 100%; max-height: 340px; display: block; }
+.fd-busy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 22px;
+  border-radius: var(--r-md);
+  border: 1px dashed var(--border);
+  font-size: 12.5px;
+  color: var(--text-mute);
+}
+.fd-ff { border-radius: var(--r-md); border: 1px solid var(--border); overflow: hidden; background: var(--bg-soft); }
+.fd-ff-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.fd-ff-note { color: var(--text-mute); }
+.fd-ff-body { position: relative; }
+.fd-ff-zoom {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--text-mute);
+  background: rgba(255, 255, 255, 0.05);
+  transition: all 0.2s var(--ease);
+}
+.fd-ff-zoom:hover { color: var(--text); background: rgba(255, 255, 255, 0.12); }
+.fd-ff img.zoomable { cursor: zoom-in; }
+.fd-ff-mask {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  background: rgba(8, 8, 14, 0.6);
+  backdrop-filter: blur(2px);
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.fd-ff-mask .spinner { width: 18px; height: 18px; }
+.fd-ff-empty {
+  padding: 46px 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-mute);
+}
+.fd-ff img {
+  display: block;
+  margin: 10px auto;
+  width: auto;
+  max-width: calc(100% - 16px);
+  max-height: 420px;
+  object-fit: contain;
+  border-radius: 6px;
+}
+
+.prompt-block { border-radius: var(--r-md); border: 1px solid var(--border); background: var(--bg-soft); overflow: hidden; }
+.pb-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 13px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.pb-badge {
+  font-size: 10px;
+  font-family: 'SF Mono', Menlo, monospace;
+  color: var(--text-mute);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.05);
+}
+.fd-textarea {
+  width: 100%;
+  min-height: 300px;
+  padding: 13px;
+  font-family: 'SF Mono', Menlo, 'PingFang SC', monospace;
+  font-size: 11.5px;
+  line-height: 1.8;
+  color: var(--text-dim);
+  background: transparent;
+  resize: vertical;
+  display: block;
+}
+.fd-textarea.short { min-height: 80px; }
+
+.fd-shots { border-radius: var(--r-md); border: 1px solid var(--border); overflow: hidden; }
+.fd-shots-head { padding: 9px 13px; font-size: 11.5px; font-weight: 600; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+.fd-shot { padding: 10px 13px; border-bottom: 1px solid var(--border); }
+.fd-shot:last-child { border-bottom: none; }
+.fd-shot-top { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-mute); }
+.fd-shot-no { color: var(--accent); font-weight: 600; }
+.fd-shot-time { font-family: 'SF Mono', Menlo, monospace; }
+.fd-shot-size { padding: 0 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.06); }
+.fd-shot-cam { opacity: 0.8; }
+.fd-shot-warn { margin-left: auto; color: var(--warn); }
+.fd-shot-line { font-size: 12px; color: var(--text); margin-top: 5px; line-height: 1.6; }
+.fd-shot-act { font-size: 11.5px; color: var(--text-mute); margin-top: 3px; line-height: 1.55; }
+
+.side-scroll { flex: 1; overflow-y: auto; padding: 11px; }
+.side-group { margin-bottom: 16px; }
+.sg-title { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--text-dim); margin-bottom: 7px; }
+.side-item { display: flex; gap: 7px; padding: 6px 8px; border-radius: 7px; background: rgba(255, 255, 255, 0.022); margin-bottom: 5px; }
+.si-thumb { width: 26px; height: 34px; border-radius: 4px; object-fit: cover; flex-shrink: 0; }
+.si-body { min-width: 0; flex: 1; }
+.si-name { display: block; font-size: 11.5px; font-weight: 550; color: var(--accent); margin-bottom: 1px; }
+.si-desc {
+  display: -webkit-box;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  line-height: 1.45;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.side-empty { font-size: 11px; color: var(--text-mute); padding: 4px 8px; }
+
+.wb-foot {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+.wf-stat { font-size: 12px; color: var(--text-mute); }
+.wf-right { display: flex; gap: 8px; }
+.wb-empty { flex: 1; display: grid; place-items: center; color: var(--text-mute); font-size: 12.5px; }
+
+/* 成片 */
+.video-body { padding: 20px 24px; }
+.vsummary {
+  display: flex;
+  gap: 26px;
+  padding: 15px 18px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.018);
+  margin-bottom: 18px;
+}
+.vs-item { display: flex; flex-direction: column; gap: 2px; }
+.vs-label { font-size: 10.5px; color: var(--text-mute); }
+.vs-value { font-size: 17px; font-weight: 680; letter-spacing: -0.02em; }
+.vs-value.done { color: var(--ok); }
+
+.vlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.vitem { border-radius: var(--r-md); border: 1px solid var(--border); background: rgba(255, 255, 255, 0.018); overflow: hidden; }
+.vitem-head { display: flex; align-items: center; gap: 8px; padding: 8px 11px; border-bottom: 1px solid var(--border); }
+.vitem-no { font-size: 11.5px; font-weight: 600; }
+.vitem-dur { font-size: 10.5px; color: var(--text-mute); }
+.vitem-go { margin-left: auto; font-size: 10.5px; color: var(--accent); }
+.vitem video { width: 100%; display: block; background: #000; }
+.vitem-empty { display: grid; place-items: center; min-height: 120px; font-size: 11.5px; color: var(--text-mute); }
+
+/* ===== 弹窗 ===== */
+.mask {
+  position: fixed;
+  inset: 0;
+  z-index: 9100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(4, 4, 9, 0.72);
+  backdrop-filter: blur(4px);
+}
+.modal {
+  width: 100%;
+  max-width: 720px;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-xl);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.9);
+  overflow: hidden;
+}
+.modal.wide { max-width: 1000px; }
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-head h3 { font-size: 15.5px; font-weight: 640; }
+.modal-sub { font-size: 11.5px; color: var(--text-mute); }
+.modal-sub .warn { color: var(--warn); }
+.modal-x {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--text-mute);
+  display: grid;
+  place-items: center;
+}
+.modal-x:hover { color: var(--text); background: var(--surface-hover); }
+.modal-body { flex: 1; overflow-y: auto; padding: 6px 20px; }
+.modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
+  padding: 13px 20px 15px;
+  border-top: 1px solid var(--border);
+}
+.modal-tip { flex: 1; font-size: 11px; color: var(--text-mute); }
+.modal-empty { padding: 30px; text-align: center; font-size: 12px; color: var(--text-mute); }
+
+.ffg { display: flex; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+.ffg:last-child { border-bottom: none; }
+.ffg-thumb {
+  width: 88px;
+  height: 140px;
+  flex: 0 0 88px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  color: var(--text-mute);
+}
+.ffg-thumb { position: relative; }
+.ffg-thumb img.zoomable { cursor: zoom-in; }
+.ffg-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 生成中：缩略图上盖一层，避免「点了没反应」的错觉 */
+.ffg-mask {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  background: rgba(8, 8, 14, 0.66);
+  backdrop-filter: blur(3px);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.ffg-mask .spinner { width: 16px; height: 16px; }
+.ff-busy-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 6px;
+  vertical-align: 1px;
+  animation: ff-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ff-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+.ffg-body { flex: 1; min-width: 0; }
+.ffg-title { font-size: 12.5px; color: var(--text); margin-bottom: 6px; }
+.ffg-count { margin-left: 6px; font-size: 11px; padding: 1px 7px; border-radius: 99px; color: var(--warn); background: rgba(251, 191, 36, 0.12); }
+.ffg-desc {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  resize: vertical;
+}
+.ffg-foot { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.ffg-frames { flex: 1; font-size: 11px; color: var(--text-mute); }
+.link-btn { font-size: 11px; color: var(--accent); }
+
+.sheet { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.sheet th {
+  position: sticky;
+  top: 0;
+  text-align: left;
+  padding: 8px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-mute);
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+.sheet td { padding: 7px 8px; border-bottom: 1px solid var(--border); color: var(--text-dim); vertical-align: top; }
+.sheet tbody tr { cursor: pointer; }
+.sheet tbody tr:hover td { background: var(--surface-hover); }
+.sheet .dim { color: var(--text-mute); }
+.sheet .mono { font-family: 'SF Mono', Menlo, monospace; }
+.sheet .line { max-width: 380px; }
+.sheet .ok { color: var(--ok); }
+.sheet .bad { color: var(--err); font-weight: 600; }
+
+/* 1101–1360：工作台还是三栏，中间只剩 ~760，三列会把文案挤到 200 出头，
+   这段改成「画面在文案上方、拆解占右栏」，内容一个不少，文案也够宽 */
+@media (max-width: 1360px) and (min-width: 1101px) {
+  .main-inner.with-media.with-shots {
+    grid-template-columns: minmax(0, 1fr) minmax(200px, 240px);
+    grid-template-areas:
+      "media shots"
+      "text  shots";
+  }
+  .main-inner.with-media.with-shots .fd-media { grid-area: media; position: static; }
+  .main-inner.with-media.with-shots .fd-text { grid-area: text; }
+  .main-inner.with-media.with-shots .fd-shots { grid-area: shots; }
+}
+@media (max-width: 1100px) {
+  .workbench { grid-template-columns: 1fr; height: auto; }
+  /* 窄屏没有第二栏的空间，画面回到文字上方 */
+  .main-inner.with-media { grid-template-columns: minmax(0, 1fr); }
+  .fd-media { position: static; }
+  .frames-col, .side-col { display: none; }
+  .main-col { min-height: 420px; }
+}
+@media (max-width: 720px) {
+  .stepper { overflow-x: auto; gap: 14px; }
+  .step-text { display: none; }
+  .panel-head, .panel-foot { padding-left: 16px; padding-right: 16px; }
+  .editor { margin: 16px; }
+  .asset-wrap { padding: 16px 16px 4px; }
+  .vsummary { flex-wrap: wrap; gap: 18px; }
+}
+</style>
