@@ -225,6 +225,25 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 			}
 		}
 
+		// 选了 360 视频：地点行整行换成「在参考视频 1 的场景中 + 人物站位」。
+		//
+		// 为什么连家具描述一起删：空间已由视频给出，文字再写一遍只会和视频里的
+		// 实际排布打架，模型还得分神判断该信谁。人物位置必须留 —— 视频里只有房间，
+		// 没有人站哪儿。位置从分镜的 [开场站位] 取（situation 里那部分旧分镜是空的）。
+		if req.SceneRef == "video" {
+			sceneName := ""
+			for _, sc := range board.Scenes {
+				if strings.TrimSpace(sc.Name) != "" {
+					sceneName = sc.Name
+					break
+				}
+			}
+			if sceneName == "" {
+				sceneName = "场景"
+			}
+			basePrompt = replaceSceneLine(basePrompt, sceneName, openingFromText(board.Text))
+		}
+
 		// 视频工作流几乎都要求参考图（首帧/角色图）。
 		// 以前这里什么都不传，9 个图位全是 null，上游直接返回 errorCode=803 JsonNull。
 		if refs := h.frameRefSlots(board, req.SceneRef); len(refs) > 0 {
@@ -1081,4 +1100,37 @@ func pickSceneImage(sc *model.Scene, sceneRef string) string {
 		}
 	}
 	return sc.ReferenceImage
+}
+
+// replaceSceneLine 把地点行整行换成「在参考视频 1 的场景中 + 人物站位」。
+//
+// 改造前：地点：@教师办公室-白天 左侧靠墙深棕木书架…；中央深棕木纹办公桌…
+// 改造后：地点：在参考视频 1 的场景中（@教师办公室-白天） @老师 坐在办公桌后，@学生 站在桌前
+//
+// 只动「地点：」这一行，其余段落一个字符都不碰。
+func replaceSceneLine(prompt, sceneName, opening string) string {
+	i := strings.Index(prompt, "地点：")
+	if i < 0 {
+		return prompt
+	}
+	lineEnd := strings.Index(prompt[i:], "\n")
+	if lineEnd < 0 {
+		lineEnd = len(prompt) - i
+	}
+	newLine := "地点：在参考视频 1 的场景中（@" + sceneName + "）"
+	if o := strings.TrimSpace(opening); o != "" {
+		newLine += " " + strings.TrimSuffix(o, "。")
+	}
+	return prompt[:i] + newLine + prompt[i+lineEnd:]
+}
+
+// openingFromText 从人读文案里取 [开场站位] 那一行 —— 这是人物位置的可靠来源。
+func openingFromText(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[开场站位]：") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "[开场站位]："))
+		}
+	}
+	return ""
 }
