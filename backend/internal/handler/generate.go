@@ -134,6 +134,11 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 		// 下面三项来自分镜工具栏，为空时沿用模型配置里的默认值
 		Duration    int    `json:"duration"`    // 秒
 		AspectRatio string `json:"aspectRatio"` // 16:9 / 9:16
+		// SceneRef 场景参考用哪一份素材：
+		//   image（默认）= 场景原图；panorama = 柱形全景图；video = 360 全景视频
+		// 选 panorama/video 时，场景图位换成全景图；选 video 还会把全景视频
+		// 作为参考视频传给 H3（节点 272），让它看清整个房间。
+		SceneRef string `json:"sceneRef"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 storyboardId"})
@@ -176,6 +181,24 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 		if req.AspectRatio != "" {
 			p["aspectRatio"] = req.AspectRatio
 		}
+		if req.SceneRef != "" {
+			p["sceneRef"] = req.SceneRef
+		}
+		// 选了 360 全景视频：视频本身也要带下去，出片时进参考视频位。
+		// 必须先 FillRefs —— board.Scenes 是从 scenesJson 还原出来的，
+		// 不先填就是空的，videoUrl 永远查不到。
+		if req.SceneRef == "video" {
+			board.FillRefs()
+			for _, sc := range board.Scenes {
+				if sc.ID == "" {
+					continue
+				}
+				if full, e := h.sceneRepo.GetByID(sc.ID); e == nil && strings.TrimSpace(full.PanoramaVideo) != "" {
+					p["videoUrl"] = full.PanoramaVideo
+					break
+				}
+			}
+		}
 		// 优先用「所属分组」的首帧图：同机位的所有段共用一张，空间和人物位置才锁得住。
 		// 没有规划结果时退回帧级 first_frame_image（按帧单独合成的那套）。
 		if h.ffRepo != nil {
@@ -198,7 +221,7 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 
 		// 视频工作流几乎都要求参考图（首帧/角色图）。
 		// 以前这里什么都不传，9 个图位全是 null，上游直接返回 errorCode=803 JsonNull。
-		if refs := h.frameRefSlots(board); len(refs) > 0 {
+		if refs := h.frameRefSlots(board, req.SceneRef); len(refs) > 0 {
 			urls := make([]string, 0, len(refs))
 			names := make([]string, 0, len(refs))
 			kinds := make([]string, 0, len(refs))
@@ -209,6 +232,18 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 			}
 			p["refImages"] = urls
 			modelPrompt = service.RewriteMentionsForModel(basePrompt, names, kinds)
+		}
+		// 用了 360 全景视频当空间参考时，得在提示词里点明这件事：
+		// 否则模型会把视频当成「要模仿的镜头」，跟着它的运镜走
+		if req.SceneRef == "video" {
+			// 实测教训：光写「不要跟着参考视频的运镜走」不够 ——
+			// 全景视频本身是高位俯视/球面展开的，模型会连视角一起抄，
+			// 出来是天花板往下拍的俯视图。必须把机位高度和平视要求写死。
+			modelPrompt += "\n\n【空间参考】参考视频只用来确认这个房间的空间结构：" +
+				"墙面、地面、家具、陈设的相对位置与它保持一致，不要重新设计房间。" +
+				"**机位不要照搬参考视频**：摄影机保持在人物视线高度（约 1.2–1.5 米），" +
+				"平视或轻微俯仰，禁止高空俯拍、禁止球面/鱼眼畸变、禁止广角拉伸。" +
+				"景别按本段要求的来，参考视频的运镜一律不要跟。"
 		}
 		if len(p) > 0 {
 			if raw, e := json.Marshal(p); e == nil {
@@ -711,7 +746,7 @@ func sortRefSlotsByName(slots []frameRefSlot) {
 // 顺序有含义：第 1 张进首帧位（51），其余依次进 49/50/43… 参考位。
 // 以前只取第一张，结果提示词里 @ 了 5 个资产、上游只收到 1 张图，
 // 模型自然不知道其他角色/道具长什么样。
-func (h *GenerateHandler) frameRefSlots(board *model.Storyboard) []frameRefSlot {
+func (h *GenerateHandler) frameRefSlots(board *model.Storyboard, sceneRef string) []frameRefSlot {
 	if board == nil {
 		return nil
 	}
@@ -809,7 +844,7 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard) []frameRefSlot 
 				continue
 			}
 			if sc, err := h.sceneRepo.GetByID(s.ID); err == nil {
-				scenes = append(scenes, frameRefSlot{URL: sc.ReferenceImage, Name: sc.Name, Kind: "scene"})
+				scenes = append(scenes, frameRefSlot{URL: pickSceneImage(sc, sceneRef), Name: sc.Name, Kind: "scene"})
 			}
 		}
 		sortRefSlotsByName(scenes)
@@ -1016,4 +1051,20 @@ func stripQuery(u string) string {
 		return u[:i]
 	}
 	return u
+}
+
+// pickSceneImage 按用户选的场景参考类型挑图。
+//
+// 选全景 / 360 视频时场景位换成柱形全景图 —— 全景图能看到房间四周，
+// 比单张正视图更能约束环境；全景图还没生成就退回原场景图，不让生成卡住。
+func pickSceneImage(sc *model.Scene, sceneRef string) string {
+	if sc == nil {
+		return ""
+	}
+	if sceneRef == "panorama" || sceneRef == "video" {
+		if strings.TrimSpace(sc.PanoramaImage) != "" {
+			return sc.PanoramaImage
+		}
+	}
+	return sc.ReferenceImage
 }

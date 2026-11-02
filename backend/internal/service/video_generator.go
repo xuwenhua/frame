@@ -35,7 +35,11 @@ func NewVideoGenerator(cfg *model.ModelConfig) *VideoGenerator {
 //
 // refs 是这一镜里 @ 到的角色 / 场景 / 道具参考图（首张进首帧位）。
 // 只传首帧会让模型对其他资产没有视觉参照，提示词里的 @ 就只是文字。
-func (g *VideoGenerator) Generate(ctx context.Context, prompt string, refs []string) (string, string, error) {
+// Generate 出片。refs 是参考图，video 是参考视频（可选）。
+//
+// 参考视频用于「让模型看清整个空间」：场景选了 360 全景视频时，
+// 它会进 H3 的 272 号视频位，模型不用再从单张场景图猜房间其余角度。
+func (g *VideoGenerator) Generate(ctx context.Context, prompt string, refs []string, video string) (string, string, error) {
 	if g.cfg == nil {
 		return "", "", fmt.Errorf("未配置视频模型")
 	}
@@ -61,7 +65,7 @@ func (g *VideoGenerator) Generate(ctx context.Context, prompt string, refs []str
 		gen := NewRHGatewayGenerator(g.cfg).WithLocalRoot(g.LocalRoot)
 		gen.OnTaskID = g.OnExternalTaskID
 		// 多图链路：H3 有 9 个图位，第 1 张进首帧位，其余进参考位
-		return gen.GenerateVideoWithRefs(ctx, prompt, cleaned, "")
+		return gen.GenerateVideoWithRefs(ctx, prompt, cleaned, video)
 	case "doubao":
 		return g.callDoubao(ctx, prompt, firstFrame)
 	default:
@@ -168,7 +172,7 @@ func (g *VideoGenerator) queryTask(ctx context.Context, base, taskID string) (st
 	}
 
 	var parsed struct {
-		Status string `json:"status"`
+		Status  string `json:"status"`
 		Content struct {
 			VideoURL string `json:"video_url"`
 		} `json:"content"`
@@ -196,4 +200,3 @@ func (g *VideoGenerator) queryTask(ctx context.Context, base, taskID string) (st
 		return "", false, nil // 仍在处理
 	}
 }
-

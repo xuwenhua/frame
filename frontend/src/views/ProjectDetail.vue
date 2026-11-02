@@ -154,6 +154,8 @@ const loadModels = async () => {
 
 // ---------- 分镜 ----------
 const frames = ref<any[]>([])
+// 首帧图功能开关：先下线（首帧图会锁死构图），代码保留可随时打开
+const ffEnabled = ref(false)
 const generating = ref(false)
 // 逐段生成的进度（SSE 推过来的）
 const genProgress = ref({ done: 0, total: 0 })
@@ -161,6 +163,17 @@ const activeFrame = ref(0)
 
 /** 画幅与视频模型属于这一集，存 episodes 表；时长按每帧描述词单独算 */
 const sbRatio = ref<'16:9' | '9:16'>('16:9')
+// 场景参考：出片时环境以哪份素材为准
+//   image    场景原图（默认）
+//   panorama 柱形全景图 —— 场景位换成全景图，房间四周都看得到
+//   video    360 全景视频 —— 额外把视频作为参考视频传给 H3（节点 272）
+const sbSceneRef = ref<'image' | 'panorama' | 'video'>('image')
+const SCENE_REF_OPTIONS: PillOption[] = [
+  { value: 'image', label: '场景图', hint: '用场景原图当环境参考（默认）' },
+  { value: 'panorama', label: '柱形全景图', hint: '场景位换成全景图，能看到房间四周' },
+  { value: 'video', label: '360 全景视频', hint: '额外把全景视频作为参考视频传入，空间约束最强' }
+]
+
 const sbDuration = ref('15')
 const videoModel = ref('')
 const epCfg = { ratio: '', model: '' }
@@ -752,7 +765,8 @@ const generateOneVideo = async (f: any) => {
       storyboardId: f.id,
       modelId: videoModel.value || undefined,
       duration: dur,
-      aspectRatio: sbRatio.value
+      aspectRatio: sbRatio.value,
+      sceneRef: sbSceneRef.value
     })
     toast.success(`已提交第 ${f.frameIndex} 段视频`, `${dur} 秒 · ${sbRatio.value}`)
     pollTasks()
@@ -781,7 +795,8 @@ const generateVideos = async () => {
         storyboardId: f.id,
         modelId: videoModel.value || undefined,
         duration: Math.max(1, Math.round(Number(f.duration) || 5)),
-        aspectRatio: sbRatio.value
+        aspectRatio: sbRatio.value,
+        sceneRef: sbSceneRef.value
       })
       submitted++
     } catch (e: any) {
@@ -1626,6 +1641,7 @@ onUnmounted(() => {
           <div class="sb-left">
             <PillSelect v-model="sbDuration" label="时长" :options="DURATION_OPTIONS" />
             <PillSelect v-model="sbRatio" label="画幅" :options="RATIO_OPTIONS" />
+            <PillSelect v-model="sbSceneRef" label="场景参考" :options="SCENE_REF_OPTIONS" :width="132" />
             <PillSelect
               v-if="videoModelOptions.length"
               v-model="videoModel"
@@ -1636,18 +1652,23 @@ onUnmounted(() => {
           </div>
           <div class="sb-right">
             <button class="sb-btn" :disabled="!frames.length" @click="shotSheetOpen = true">分镜表</button>
-            <button class="sb-btn" :disabled="ffPlanning || !frames.length" @click="planFirstFrames">
-              {{ ffPlanning ? '规划中…' : '首帧规划' }}
-            </button>
-            <button
-              class="sb-btn"
-              :disabled="!ffGroups.length || ffGenBusy"
-              title="查看已生成的首帧参考图"
-              @click="openFirstFramePanel"
-            >
-              <span v-if="ffGenBusy" class="spinner"></span>
-              {{ ffGenBusy ? '首帧生成中…' : `首帧图（${ffGroups.filter((g: any) => g.image).length}/${ffGroups.length}）` }}
-            </button>
+            <!-- 首帧图功能已下线：视频参考改用「场景图 + 角色 + 道具」，
+                 首帧图会锁死构图，反而让每段画面都从同一张图起幅。
+                 后端能力保留，把 ffEnabled 改回 true 即可恢复。 -->
+            <template v-if="ffEnabled">
+              <button class="sb-btn" :disabled="ffPlanning || !frames.length" @click="planFirstFrames">
+                {{ ffPlanning ? '规划中…' : '首帧规划' }}
+              </button>
+              <button
+                class="sb-btn"
+                :disabled="!ffGroups.length || ffGenBusy"
+                title="查看已生成的首帧参考图"
+                @click="openFirstFramePanel"
+              >
+                <span v-if="ffGenBusy" class="spinner"></span>
+                {{ ffGenBusy ? '首帧生成中…' : `首帧图（${ffGroups.filter((g: any) => g.image).length}/${ffGroups.length}）` }}
+              </button>
+            </template>
             <button class="sb-btn" :disabled="generating" @click="generateStoryboard">
               {{ generating ? (genProgress.total ? `生成中 ${genProgress.done}/${genProgress.total}` : '生成中…') : '重新生成' }}
             </button>
