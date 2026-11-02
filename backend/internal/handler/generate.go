@@ -1105,7 +1105,7 @@ func replaceSceneLine(prompt, sceneName, opening string) string {
 	if lineEnd < 0 {
 		lineEnd = len(prompt) - i
 	}
-	newLine := "地点：在参考视频 1 的场景中（@" + sceneName + "）"
+	newLine := "地点：在参考视频 1（" + sceneName + "）的场景中"
 	if o := strings.TrimSpace(opening); o != "" {
 		newLine += " " + strings.TrimSuffix(o, "。")
 	}
