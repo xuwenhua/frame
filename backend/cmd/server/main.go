@@ -251,6 +251,8 @@ func main() {
 				storyboard.POST("/generate", storyboardHandler.Generate)
 				// 逐段生成 + SSE：先出大纲，再一段段推给前端
 				storyboard.POST("/generate/stream", storyboardHandler.GenerateStream)
+				// 只出大纲，给前端弹窗确认；确认后再调 generate/stream 展开
+				storyboard.POST("/outline", storyboardHandler.Outline)
 				storyboard.PUT("/:id", storyboardHandler.Update)
 				storyboard.DELETE("/:id", storyboardHandler.DeleteFrame)
 				storyboard.POST("/:id/regenerate", storyboardHandler.Regenerate)

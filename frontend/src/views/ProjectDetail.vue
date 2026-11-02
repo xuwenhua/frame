@@ -159,6 +159,10 @@ const ffEnabled = ref(false)
 const generating = ref(false)
 // 逐段生成的进度（SSE 推过来的）
 const genProgress = ref({ done: 0, total: 0 })
+// 大纲确认弹窗：先看拆分方案，确认后再逐段展开
+const outlineOpen = ref(false)
+const outlineLoading = ref(false)
+const outlineList = ref<any[]>([])
 const activeFrame = ref(0)
 
 /** 画幅与视频模型属于这一集，存 episodes 表；时长按每帧描述词单独算 */
@@ -490,6 +494,7 @@ const identify = async () => {
 }
 
 // ---------- 生成分镜 ----------
+/** 先只拿大纲：拆错了在这里就能看出来，不用等整集跑完 */
 const generateStoryboard = async () => {
   if (!episodeId.value) return toast.warning('请先识别资产')
   if (frames.value.length > 0) {
@@ -501,6 +506,25 @@ const generateStoryboard = async () => {
     })
     if (!ok) return
   }
+  outlineLoading.value = true
+  try {
+    const res: any = await api.post('/storyboard/outline', { episodeId: episodeId.value })
+    outlineList.value = res.data?.outline || []
+    if (!outlineList.value.length) {
+      toast.warning('没拆出段落', '剧本可能太短，或模型没返回有效大纲')
+      return
+    }
+    outlineOpen.value = true
+  } catch (e: any) {
+    toast.error('大纲生成失败', e.response?.data?.message || e.message)
+  } finally {
+    outlineLoading.value = false
+  }
+}
+
+/** 确认大纲后，按这份大纲逐段展开（不再重新规划） */
+const runStoryboardStream = async () => {
+  outlineOpen.value = false
   generating.value = true
   genProgress.value = { done: 0, total: 0 }
   let warnMsg = ''
@@ -510,7 +534,12 @@ const generateStoryboard = async () => {
     await streamPOST<any>(
       '/storyboard/generate/stream',
       // 场景参考在这里就定下来：提示词的详略按它写，并记到分镜上供出片沿用
-      { episodeId: episodeId.value, duration: sbSeconds.value, sceneRef: sbSceneRef.value },
+      {
+        episodeId: episodeId.value,
+        duration: sbSeconds.value,
+        sceneRef: sbSceneRef.value,
+        outline: outlineList.value
+      },
       (ev) => {
         if (ev.type === 'outline') {
           genProgress.value = { done: 0, total: ev.count || 0 }
@@ -2167,6 +2196,44 @@ onUnmounted(() => {
         </div>
       </div>
     </Teleport>
+
+    <!-- 大纲确认：先看拆分方案，确认后再逐段展开 -->
+    <div v-if="outlineOpen" class="ol-mask" @click.self="outlineOpen = false">
+      <div class="ol-panel">
+        <div class="ol-head">
+          <div>
+            <h3>分镜大纲</h3>
+            <p>确认拆分方案后再生成，避免整集跑完才发现拆错</p>
+          </div>
+          <span class="ol-count">{{ outlineList.length }} 个叙事单元</span>
+        </div>
+
+        <div class="ol-body">
+          <div v-for="it in outlineList" :key="it.index" class="ol-item">
+            <span class="ol-idx">{{ it.index }}</span>
+            <div class="ol-main">
+              <div class="ol-meta">
+                <span class="ol-scene">{{ it.scene }}</span>
+                <span v-for="r in it.roles || []" :key="r" class="ol-role">@{{ r }}</span>
+                <span v-for="x in it.items || []" :key="x" class="ol-item-tag">{{ x }}</span>
+              </div>
+              <p class="ol-beat">{{ it.beat }}</p>
+              <p v-if="it.lines && it.lines.length" class="ol-lines">
+                <span v-for="(l, i) in it.lines" :key="i">「{{ l }}」</span>
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div class="ol-foot">
+          <button class="btn btn-ghost" @click="outlineOpen = false">取消</button>
+          <button class="btn btn-ghost" :disabled="outlineLoading" @click="generateStoryboard">
+            {{ outlineLoading ? '重新拆分中…' : '重新拆分' }}
+          </button>
+          <button class="btn btn-primary" @click="runStoryboardStream">确认，开始生成</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -3311,5 +3378,96 @@ onUnmounted(() => {
   color: #7aa7ff;
   font-size: 10px;
   line-height: 15px;
+}
+/* 大纲确认弹窗 */
+.ol-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+.ol-panel {
+  width: min(720px, 92vw);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel, #17181c);
+  border: 1px solid var(--line, #2a2d34);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.ol-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--line, #2a2d34);
+}
+.ol-head h3 { margin: 0 0 4px; font-size: 15px; }
+.ol-head p { margin: 0; font-size: 12px; color: var(--text-dim, #8a8f98); }
+.ol-count {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-dim, #8a8f98);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.ol-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 18px;
+}
+.ol-item {
+  display: flex;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+.ol-item:last-child { border-bottom: none; }
+.ol-idx {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(75, 139, 245, 0.16);
+  color: #7aa7ff;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ol-main { flex: 1; min-width: 0; }
+.ol-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ol-scene { font-size: 12px; color: #7aa7ff; }
+.ol-role {
+  font-size: 11px;
+  color: var(--text-dim, #8a8f98);
+}
+.ol-item-tag {
+  font-size: 11px;
+  color: #8a8f98;
+  border: 1px solid var(--line, #2a2d34);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.ol-beat { margin: 5px 0 0; font-size: 13px; line-height: 1.55; }
+.ol-lines {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-dim, #8a8f98);
+  line-height: 1.6;
+}
+.ol-lines span { margin-right: 4px; }
+.ol-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line, #2a2d34);
 }
 </style>

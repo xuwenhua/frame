@@ -226,6 +226,7 @@ func (s *LLMStoryboardService) GenerateStream(
 	items []model.Item,
 	duration int,
 	sceneRef string,
+	preset []OutlineItem,
 	emit func(StreamEvent),
 ) ([]FrameDraft, error) {
 	// 没有可用模型时退回规则引擎（一次性出完）
@@ -239,9 +240,15 @@ func (s *LLMStoryboardService) GenerateStream(
 		return drafts, nil
 	}
 
-	outline, err := s.PlanOutline(ctx, script, chars, scenes, items)
-	if err != nil {
-		return nil, err
+	// 用户在确认弹窗里看过（也可能改过）的大纲直接用，不重新规划 ——
+	// 重新跑一遍会得到不同拆法，用户刚确认的东西就白确认了。
+	outline := preset
+	if len(outline) == 0 {
+		var err error
+		outline, err = s.PlanOutline(ctx, script, chars, scenes, items)
+		if err != nil {
+			return nil, err
+		}
 	}
 	emit(StreamEvent{Type: "outline", Count: len(outline), Outline: outline})
 

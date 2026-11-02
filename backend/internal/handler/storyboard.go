@@ -422,6 +422,9 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 		// SceneRef 出片时场景用哪份素材（image/panorama/video）。
 		// 在这里定下来，提示词的详略按它写，并记到分镜上供出片时默认使用。
 		SceneRef string `json:"sceneRef"`
+		// Outline 用户在确认弹窗里看过（可能还改过）的大纲。
+		// 传了就不再重新规划 —— 不然拆法一变，用户刚确认的东西就白确认了。
+		Outline []service.OutlineItem `json:"outline"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 episodeId"})
@@ -465,7 +468,7 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 600*time.Second)
 	defer cancel()
 
-	drafts, err := svc.GenerateStream(ctx, ep.ScriptText, chars, scenes, items, req.Duration, req.SceneRef, send)
+	drafts, err := svc.GenerateStream(ctx, ep.ScriptText, chars, scenes, items, req.Duration, req.SceneRef, req.Outline, send)
 	if err != nil {
 		send(service.StreamEvent{Type: "error", Message: err.Error()})
 		return
@@ -514,4 +517,50 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 	}
 
 	send(service.StreamEvent{Type: "done", Count: len(frames), Message: warning})
+}
+
+// Outline 只生成「叙事单元大纲」，给前端弹窗确认用，不落库、不扣积分。
+//
+// 为什么单独一个接口：整集一次生成要几十秒，用户看不到中间过程，
+// 拆错了只能整集重跑。先出大纲让他确认（或改），确认完再逐段展开。
+func (h *StoryboardHandler) Outline(c *gin.Context) {
+	userID := middleware.CurrentUserID(c)
+	var req struct {
+		EpisodeID string `json:"episodeId" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 episodeId"})
+		return
+	}
+
+	ep, err := h.ownedEpisode(req.EpisodeID, userID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "剧集不存在"})
+		return
+	}
+	if strings.TrimSpace(ep.ScriptText) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "这一集还没有剧本"})
+		return
+	}
+
+	chars, _ := h.charRepo.ListByEpisodeID(req.EpisodeID)
+	scenes, _ := h.sceneRepo.ListByEpisodeID(req.EpisodeID)
+	items, _ := h.itemRepo.ListByEpisodeID(req.EpisodeID)
+
+	client, _, _ := h.provider.LLM()
+	svc := service.NewLLMStoryboardService(client)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 180*time.Second)
+	defer cancel()
+
+	outline, err := svc.PlanOutline(ctx, ep.ScriptText, chars, scenes, items)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0, "message": "ok",
+		"data": gin.H{"outline": outline, "count": len(outline)},
+	})
 }
