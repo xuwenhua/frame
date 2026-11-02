@@ -627,6 +627,12 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 	b.WriteString("每句台词在所在镜头内念完，念完才切下一个镜头；")
 	b.WriteString("只有正在说话的角色动嘴，其他人闭口；")
 	b.WriteString("人物位置严格按「站位」行，全程不换座、不绕桌走动；单人镜头里其他人不入画；")
+	// 场景元素约束：360 视频模式下地点行不列家具，模型容易按「教室」的刻板印象
+	// 自己加黑板/讲台（实测出一段里凭空多了一块黑板，而场景是白板）。
+	if d.SceneRef == "video" {
+		b.WriteString("场景以参考视频为准：墙面、家具、陈设都照参考视频来，" +
+			"**不要添加参考视频里没有的东西**（例如黑板、讲台、投影幕、挂钟）；")
+	}
 	b.WriteString("不要 BGM，只保留同期声。\n")
 
 	return b.String()
