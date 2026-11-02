@@ -639,14 +639,14 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 func standingLine(d FrameDraft) string {
 	if shots := normalizeShots(d); len(shots) > 0 {
 		if s := strings.TrimSpace(shots[0].State); s != "" {
-			return s
+			return ensureSeatWords(s)
 		}
 	}
 	// Situation 是「时间 + 地点 + 站位」混在一起的一段，取最后一个句号之后的部分
 	if s := strings.TrimSpace(d.Situation); s != "" {
 		if i := strings.LastIndex(s, "。"); i > 0 && i < len(s)-1 {
 			if tail := strings.TrimSpace(s[i+len("。"):]); tail != "" {
-				return tail
+				return ensureSeatWords(tail)
 			}
 		}
 	}
@@ -1429,4 +1429,18 @@ func RescalePromptDuration(prompt string, total int) string {
 	out = summaryOneShotRe.ReplaceAllString(out, fmt.Sprintf("单镜头 %d 秒", total))
 	out = summaryMultiRe.ReplaceAllString(out, fmt.Sprintf("共 %d 秒", total))
 	return out
+}
+
+// ensureSeatWords 站位缺方位时补一句兜底。
+//
+// 实测 LLM 有时只写「@学生 坐在对面」，不说哪一侧 —— 模型收到这种描述
+// 就会自己摆，结果同一场戏里座位来回换。这里只在明显缺方位时才补，
+// 已经写了「靠文件柜一侧」这类的不动。
+func ensureSeatWords(s string) string {
+	for _, k := range []string{"靠", "一侧", "一边", "左侧", "右侧", "东侧", "西侧", "内侧", "外侧", "桌后", "桌前"} {
+		if strings.Contains(s, k) {
+			return s
+		}
+	}
+	return s + "（两人各坐自己那一侧、隔桌相对，不换座、不绕桌走动）"
 }
