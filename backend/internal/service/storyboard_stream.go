@@ -293,7 +293,8 @@ func (s *LLMStoryboardService) GenerateStream(
 			d, err = s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef,
 				"\n\n【上一版的问题】situation 里没有写清「人物坐在哪一侧」，只有「坐在对面」这种描述。"+
 					"这一段是独立生成的视频，模型看不到别的段落，必须在这一段里把位置写死："+
-					"主角坐在「靠 XX 一侧」，对方坐在「靠 XX 一侧」，用场景里真实存在的参照物（书架/窗/白板/门口）。",
+					"主角坐在「靠 XX 一侧的 XX 椅子」上，对方坐在「靠 XX 一侧的 XX 椅子」上；"+
+					"位置和椅子外观都要写，让人一眼能认出是哪一把。",
 				chars, scenes, items)
 		}
 		if err != nil {
@@ -434,12 +435,27 @@ func draftFromRaw(f llmFrameRaw, idx int, chars []model.Character, scenes []mode
 	return d
 }
 
-// hasSeatWords 判断站位描述里有没有「哪一侧」的信息。
+// hasSeatWords 判断站位是否「唯一可指认」：位置 + 家具特征都要有。
+//
+// 只写「坐在那一侧的椅子上」不够 —— 同一侧可能不止一把椅子，
+// 模型不知道坐哪把，会自己摆一把出来。所以要求同时出现：
+//
+//	位置词（靠 X 一侧 / 桌后 …）
+//	家具特征（椅子 / 转椅 / 靠背椅 / 凳子 / 沙发 …）
 func hasSeatWords(s string) bool {
+	hasPos := false
 	for _, k := range []string{"靠", "一侧", "一边", "左侧", "右侧", "东侧", "西侧", "内侧", "外侧", "桌后", "桌前"} {
 		if strings.Contains(s, k) {
-			return true
+			hasPos = true
+			break
 		}
 	}
-	return false
+	hasFurniture := false
+	for _, k := range []string{"椅", "凳", "沙发", "座位", "座上"} {
+		if strings.Contains(s, k) {
+			hasFurniture = true
+			break
+		}
+	}
+	return hasPos && hasFurniture
 }

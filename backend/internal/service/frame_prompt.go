@@ -1453,10 +1453,23 @@ func RescalePromptDuration(prompt string, total int) string {
 // 就会自己摆，结果同一场戏里座位来回换。这里只在明显缺方位时才补，
 // 已经写了「靠文件柜一侧」这类的不动。
 func ensureSeatWords(s string) string {
+	// 和 storyboard_stream 的 hasSeatWords 同口径：位置 + 家具都要有才算写清楚
+	hasPos := false
 	for _, k := range []string{"靠", "一侧", "一边", "左侧", "右侧", "东侧", "西侧", "内侧", "外侧", "桌后", "桌前"} {
 		if strings.Contains(s, k) {
-			return s
+			hasPos = true
+			break
 		}
+	}
+	hasFurniture := false
+	for _, k := range []string{"椅", "凳", "沙发", "座位", "座上"} {
+		if strings.Contains(s, k) {
+			hasFurniture = true
+			break
+		}
+	}
+	if hasPos && hasFurniture {
+		return s
 	}
 	// 最后的兜底：重试也失败时才走到这。只能给笼统约束 ——
 	// 具体哪一侧要靠 LLM 写，硬编反而会写错。
