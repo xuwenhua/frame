@@ -35,13 +35,14 @@ type OutlineItem struct {
 
 // StreamEvent 推给前端的流式事件
 type StreamEvent struct {
-	Type    string        `json:"type"` // outline / frame / done / error
-	Count   int           `json:"count,omitempty"`
-	Index   int           `json:"index,omitempty"`
-	Total   int           `json:"total,omitempty"`
-	Frame   *FrameDraft   `json:"frame,omitempty"`
-	Outline []OutlineItem `json:"outline,omitempty"`
-	Message string        `json:"message,omitempty"`
+	Type    string            `json:"type"` // outline / frame / done / error
+	Count   int               `json:"count,omitempty"`
+	Index   int               `json:"index,omitempty"`
+	Total   int               `json:"total,omitempty"`
+	Frame   *FrameDraft       `json:"frame,omitempty"`
+	Outline []OutlineItem     `json:"outline,omitempty"`
+	Seats   map[string]string `json:"seats,omitempty"`
+	Message string            `json:"message,omitempty"`
 }
 
 const outlineSystemPrompt = `你是短剧导演。给你剧本，先拆「叙事单元大纲」，不写画面细节。
@@ -261,6 +262,17 @@ func (s *LLMStoryboardService) GenerateStream(
 		return drafts, nil
 	}
 
+	// 先定「座位表」：每个角色坐哪把椅子，一次定死，后面每段都用它。
+	//
+	// 为什么不让模型每段自己写：实测它每段都换个说法（一会儿「靠窗那侧」、
+	// 一会儿「离门最近那把」），同一个座位在不同段落里叫法不同，模型就当成
+	// 不同位置，人物在整集里来回漂。座位表定下来后，站位由代码拼，
+	// 模型只负责给动作。
+	seatMap := s.PlanSeats(ctx, chars, scenes)
+	if len(seatMap) > 0 {
+		emit(StreamEvent{Type: "seats", Seats: seatMap})
+	}
+
 	// 用户在确认弹窗里看过（也可能改过）的大纲直接用，不重新规划 ——
 	// 重新跑一遍会得到不同拆法，用户刚确认的东西就白确认了。
 	outline := preset
@@ -290,6 +302,7 @@ func (s *LLMStoryboardService) GenerateStream(
 		// 模型选了这个更强的措辞 —— 段 8 坐着、段 9 又站起来，就是这么来的。
 		// 位置和姿态由 prevEnd 一段段链式传下去，才是唯一真相。
 		d, err := s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef, "", chars, scenes, items)
+		d.SeatMap = seatMap
 
 		// 站位必须写明「坐哪一侧」—— 每段都是独立生成的视频，模型看不到上一段，
 		// 只写「坐在对面」它就只能自己摆，整集座位来回换。缺了就重试一次。
@@ -301,6 +314,7 @@ func (s *LLMStoryboardService) GenerateStream(
 					"主角坐在「靠 XX 一侧的 XX 椅子」上，对方坐在「靠 XX 一侧的 XX 椅子」上；"+
 					"位置和椅子外观都要写，让人一眼能认出是哪一把。",
 				chars, scenes, items)
+			d.SeatMap = seatMap
 		}
 		if err != nil {
 			log.Printf("分镜第 %d 段连续失败，跳过：%v", item.Index, err)
@@ -463,4 +477,67 @@ func hasSeatWords(s string) bool {
 		}
 	}
 	return hasPos && hasFurniture
+}
+
+// PlanSeats 给每个角色分配一把唯一的椅子，返回「角色名 → 座位描述」。
+//
+// 座位描述要具体到「能一眼认出来是哪一把」：位置 + 参照物 + 椅子外观。
+// 这一步只跑一次，之后每段的站位都由它拼出来，不再让模型自由发挥 ——
+// 否则同一个座位在不同段落里会被叫成不同名字，模型以为换了位置。
+func (s *LLMStoryboardService) PlanSeats(ctx context.Context, chars []model.Character, scenes []model.Scene) map[string]string {
+	if len(chars) == 0 {
+		return nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("给下面这些角色各分配一个座位，要求每个座位唯一可指认。\n\n")
+	if len(scenes) > 0 {
+		sb.WriteString("场景布局：\n")
+		for _, sc := range scenes {
+			fmt.Fprintf(&sb, "- %s：%s\n", sc.Name, strings.TrimSpace(sc.SpatialAnchor))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("角色：\n")
+	for _, c := range chars {
+		fmt.Fprintf(&sb, "- %s（%s）\n", c.Name, briefIdentity(c.IdentityAnchor))
+	}
+	sb.WriteString("\n座位描述必须包含三样：位置（靠窗那一侧 / 桌后）、" +
+		"参照物与方位（离门口最近 / 离白板最远 / 第二把）、椅子外观（深灰布面转椅 / 木质靠背椅）。\n")
+	sb.WriteString("不要用「左边」「右边」—— 画面方向会随机位翻转。\n")
+	sb.WriteString("只输出 JSON，不要解释：{\"老师\":\"办公桌靠窗那一侧、离门口最近的那把深灰布面转椅\",\"学生\":\"...\"}\n")
+
+	res, err := s.client.Chat(ctx, []aiclient.ChatMessage{
+		{Role: "system", Content: "你是短剧分镜的场记。只输出 JSON。"},
+		{Role: "user", Content: sb.String()},
+	}, 0.2, 1200)
+	if err != nil {
+		log.Printf("座位表生成失败（继续用模型自由写法）：%v", err)
+		return nil
+	}
+
+	raw := extractJSON(res.Content)
+	if raw == "" {
+		return nil
+	}
+	raw = strings.TrimSpace(raw)
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return nil
+	}
+	out := map[string]string{}
+	if e := json.Unmarshal([]byte(raw[start:end+1]), &out); e != nil {
+		log.Printf("座位表解析失败：%v", e)
+		return nil
+	}
+	// 只保留有内容的
+	clean := map[string]string{}
+	for k, v := range out {
+		if strings.TrimSpace(v) != "" {
+			clean[k] = strings.TrimSpace(v)
+		}
+	}
+	log.Printf("座位表：%v", clean)
+	return clean
 }

@@ -643,6 +643,21 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 // 优先用第一镜的 State（LLM 给的起始状态，最准）；
 // 没有就退回 Situation 里描述站位的那半句；再没有就按人数给个兜底。
 func standingLine(d FrameDraft) string {
+	// 有座位表就完全按表拼 —— 这是最稳的一层。
+	// 模型每段都会换个说法描述同一个座位，模型自己读着像换了位置，
+	// 干脆不让它写位置：位置查表，动作交给镜头的 action。
+	if len(d.SeatMap) > 0 && len(d.Roles) > 0 {
+		parts := make([]string, 0, len(d.Roles))
+		for _, r := range d.Roles {
+			if seat, ok := d.SeatMap[r.Name]; ok && strings.TrimSpace(seat) != "" {
+				parts = append(parts, "@"+r.Name+" 坐在"+seat)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "；") + "（全程固定座位，不换座）"
+		}
+	}
+
 	if shots := normalizeShots(d); len(shots) > 0 {
 		if s := strings.TrimSpace(shots[0].State); s != "" {
 			return ensureSeatWords(s)
