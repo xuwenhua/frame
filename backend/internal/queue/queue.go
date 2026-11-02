@@ -291,9 +291,20 @@ func (q *Queue) writeBack(task *model.GenerationTask, url string) {
 		// 换了 H3 工作流后出 3/5/7 秒的片子，writeBack 却把分镜的
 		// duration 统一改成 13 —— 卡片显示 13 秒、描述词写 0.00–3.00s，
 		// 用户以为时长对不上，其实是这里写坏的。
+		// 不覆盖 duration。
+		//
+		// duration 是「这段内容需要几秒」的需求值，由台词字数和镜头数算出来；
+		// 出片时长是这一单的结果值。以前把结果写回需求，后果是：
+		// 某次出片按 5 秒提交（前端 `|| 5` 兜底时会这样），分镜就被永久改成 5 秒，
+		// 之后每次出片都只给 5 秒 —— 台词念不完，用户看到「十几秒刷新变 5 秒」。
 		updates := map[string]interface{}{"video_url": url}
-		if d := taskDuration(task.Params); d > 0 {
-			updates["duration"] = d
+		// 只有在分镜完全没设过时长（0）时，才用这次出片的时长兜个底，
+		// 避免卡片显示 0 秒；已经有值时一个字都不改
+		var cur model.Storyboard
+		if e := q.db.Select("duration").Where("id = ?", task.AssetID).First(&cur).Error; e == nil && cur.Duration <= 0 {
+			if d := taskDuration(task.Params); d > 0 {
+				updates["duration"] = d
+			}
 		}
 		q.db.Model(&model.Storyboard{}).Where("id = ?", task.AssetID).Updates(updates)
 	}
