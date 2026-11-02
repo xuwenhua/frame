@@ -698,6 +698,13 @@ const makePanoramaVideo = async (a: any) => {
 const editOpen = ref(false)
 const editType = ref<'character' | 'scene' | 'item'>('character')
 const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', voiceTone: '', voiceSample: '' })
+// 音色二选一：文字描述 或 参考音频，两者互斥（同时存在会让描述词和音频位打架）
+const voiceMode = ref<'text' | 'audio'>('text')
+const setVoiceMode = (m: 'text' | 'audio') => {
+  voiceMode.value = m
+  if (m === 'text') editForm.value.voiceSample = ''
+  else editForm.value.voiceTone = ''
+}
 const editSaving = ref(false)
 const uploading = ref(false)
 const viewerSrc = ref('')
@@ -723,9 +730,12 @@ const openEdit = (type: 'character' | 'scene' | 'item', a: any) => {
     name: a.name || '',
     imagePrompt: a.imagePrompt || '',
     referenceImage: a.referenceImage || '',
+    // 二选一：已经有音频就停在「参考音频」，否则停在「文字描述」
     voiceTone: a.voiceTone || '',
     voiceSample: a.voiceSample || ''
   }
+  voiceMode.value = a.voiceSample ? 'audio' : 'text'
+  if (voiceMode.value === 'audio') editForm.value.voiceTone = ''
   editOpen.value = true
 }
 
@@ -2083,13 +2093,32 @@ onUnmounted(() => {
                   <span>名称</span>
                   <input v-model="editForm.name" type="text" placeholder="角色 / 场景 / 道具名" />
                 </label>
-                <label v-if="editType === 'character'" class="ed-field">
-                  <span>音色描述</span>
-                  <input v-model="editForm.voiceTone" type="text" placeholder="如：沉稳中年女音，中低音域，语速中等偏慢" />
-                </label>
                 <div v-if="editType === 'character'" class="ed-field">
-                  <span>音色样本<em class="ed-opt">可选，最长 15 秒</em></span>
-                  <div class="voice-row">
+                  <span>音色<em class="ed-opt">二选一：文字描述 或 参考音频</em></span>
+                  <div class="seg">
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      :class="{ on: voiceMode === 'text' }"
+                      @click="setVoiceMode('text')"
+                    >文字描述</button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      :class="{ on: voiceMode === 'audio' }"
+                      @click="setVoiceMode('audio')"
+                    >参考音频</button>
+                  </div>
+
+                  <input
+                    v-if="voiceMode === 'text'"
+                    v-model="editForm.voiceTone"
+                    type="text"
+                    class="voice-input"
+                    placeholder="如：沉稳中年女音，中低音域，语速中等偏慢"
+                  />
+
+                  <div v-else class="voice-row">
                     <input
                       id="voice-file-input"
                       type="file"
@@ -2103,10 +2132,10 @@ onUnmounted(() => {
                       :disabled="uploading"
                       @click="pickVoiceFile"
                     >
-                      {{ uploading ? '上传中…' : '选择音频' }}
+                      {{ uploading ? '上传中…' : editForm.voiceSample ? '更换音频' : '选择音频' }}
                     </button>
                     <audio v-if="editForm.voiceSample" :src="editForm.voiceSample" controls class="voice-audio"></audio>
-                    <span v-else class="ed-hint">未上传 · 会用上面的文字描述配音</span>
+                    <span v-else class="ed-hint">未上传 · 最长 15 秒</span>
                     <button
                       v-if="editForm.voiceSample"
                       type="button"
@@ -3556,4 +3585,26 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-dim, #8a8f98);
 }
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+  margin-bottom: 8px;
+}
+.seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim, #8a8f98);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.seg-btn.on {
+  background: rgba(75, 139, 245, 0.18);
+  color: #7aa7ff;
+}
+.voice-input { width: 100%; }
 </style>
