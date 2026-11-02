@@ -502,8 +502,12 @@ func (s *LLMStoryboardService) PlanSeats(ctx context.Context, chars []model.Char
 	for _, c := range chars {
 		fmt.Fprintf(&sb, "- %s（%s）\n", c.Name, briefIdentity(c.IdentityAnchor))
 	}
-	sb.WriteString("\n座位描述必须包含三样：位置（靠窗那一侧 / 桌后）、" +
-		"参照物与方位（离门口最近 / 离白板最远 / 第二把）、椅子外观（深灰布面转椅 / 木质靠背椅）。\n")
+	sb.WriteString("\n座位描述要写成「位置 + 参照物方位」，例如" +
+		"「办公桌靠窗那一侧、离门口最近的那把」。\n")
+	sb.WriteString("**椅子外观只能引用上面场地布局里已经写过的词**：" +
+		"布局里写「两把深灰布面椅」就用「深灰布面椅」；" +
+		"布局里根本没提椅子长什么样，就**只写位置和参照物，不要虚构材质/颜色**" +
+		"（写「木质靠背椅」「皮质转椅」这类凭空出现的描述，会和参考图对不上，模型反而画错）。\n")
 	sb.WriteString("不要用「左边」「右边」—— 画面方向会随机位翻转。\n")
 	sb.WriteString("只输出 JSON，不要解释：{\"老师\":\"办公桌靠窗那一侧、离门口最近的那把深灰布面转椅\",\"学生\":\"...\"}\n")
 
