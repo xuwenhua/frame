@@ -1430,6 +1430,10 @@ onUnmounted(() => {
               </template>
             </PillSelect>
             <span class="gt-sep"></span>
+            <!-- 场景参考：资产页也能选 —— 场景图/全景图/360 视频都在这一页，
+                 选完去生成分镜，提示词的详略就按它写 -->
+            <PillSelect v-model="sbSceneRef" label="场景参考" :options="SCENE_REF_OPTIONS" :width="132" />
+            <span class="gt-sep"></span>
             <PillToggle
               v-model="genOpts.showName"
               label="角色名"
