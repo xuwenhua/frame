@@ -838,7 +838,10 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard, sceneRef string
 		}
 	}
 
-	if !hasFirstFrame {
+	// 选了 360 全景视频时**不再传场景图**：一张单视角图 + 一段全景视频，
+	// 两套空间参考会互相打架（图说房间长这样、视频说另一个样），
+	// 模型会挑一个照抄，机位和布局都跟着乱。视频本身就是最完整的空间参考。
+	if !hasFirstFrame && sceneRef != "video" {
 		for _, s := range board.Scenes {
 			if s.ID == "" {
 				continue
