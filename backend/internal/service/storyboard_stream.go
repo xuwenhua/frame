@@ -179,8 +179,13 @@ func expandUserPrompt(item OutlineItem, total int, script, prevEnd, baseSituatio
 		b.WriteString("【上一段结束时的画面 —— 这一段必须从这里接着演】\n")
 		b.WriteString(prevEnd + "\n")
 		b.WriteString("人物在哪一侧、坐着还是站着、手里拿着什么、桌子在两之间的位置，全部沿用上面的状态。\n")
-		b.WriteString("**只有在台词明确要求时才能改变姿态**（例如角色说「走吧」才起身），" +
-			"而且要在对应镜头的 action 里写出触发点；台词没要求就不许改姿态、不许换座。\n\n")
+		b.WriteString("**坐谈戏的默认状态就是「不动」**：两个人坐着说话，整段结束还是原样坐着，" +
+			"不会因为切了个镜头、换了个景别就换座位 —— 这是常识，观众也不接受。\n")
+		b.WriteString("所以：**本段 situation 的站位，除了台词明确要求的情况，必须逐字沿用上一段的写法**" +
+			"（包括「靠窗那一侧、离门口最近的那把椅子」这种定位方式）。\n")
+		b.WriteString("**只有台词明确要求时才能改姿态或换座**（例如角色说「走吧」才起身、" +
+			"「你坐这边」才换位），而且必须在该镜头的 action 里写出触发动作；" +
+			"台词没要求就不许改姿态、不许换座、不许改朝向。\n\n")
 	}
 	if strings.TrimSpace(baseSituation) != "" {
 		b.WriteString("【全局站位基准】整集不变，这一段也必须一致：\n")
