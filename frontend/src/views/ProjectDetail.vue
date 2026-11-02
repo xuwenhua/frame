@@ -700,10 +700,10 @@ const editType = ref<'character' | 'scene' | 'item'>('character')
 const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', voiceTone: '', voiceSample: '' })
 // 音色二选一：文字描述 或 参考音频，两者互斥（同时存在会让描述词和音频位打架）
 const voiceMode = ref<'text' | 'audio'>('text')
+// 切换只是切显示，不清数据 —— 来回切一下不该把填好的东西弄丢。
+// 真正「二选一」在保存时做：只提交当前这一栏，另一栏传空。
 const setVoiceMode = (m: 'text' | 'audio') => {
   voiceMode.value = m
-  if (m === 'text') editForm.value.voiceSample = ''
-  else editForm.value.voiceTone = ''
 }
 const editSaving = ref(false)
 const uploading = ref(false)
@@ -735,7 +735,6 @@ const openEdit = (type: 'character' | 'scene' | 'item', a: any) => {
     voiceSample: a.voiceSample || ''
   }
   voiceMode.value = a.voiceSample ? 'audio' : 'text'
-  if (voiceMode.value === 'audio') editForm.value.voiceTone = ''
   editOpen.value = true
 }
 
@@ -796,9 +795,14 @@ const saveAsset = async () => {
     const payload: Record<string, any> = { name: f.name, imagePrompt: f.imagePrompt }
     if (f.referenceImage) payload.referenceImage = f.referenceImage
     if (editType.value === 'character') {
-      payload.voiceTone = f.voiceTone
-      // 空串也要传：用户删掉音频时要能真正清空
-      payload.voiceSample = f.voiceSample || ''
+      // 二选一在保存时落地：只提交当前选中的那一栏，另一栏显式传空清掉
+      if (voiceMode.value === 'audio') {
+        payload.voiceTone = ''
+        payload.voiceSample = f.voiceSample || ''
+      } else {
+        payload.voiceTone = f.voiceTone || ''
+        payload.voiceSample = ''
+      }
     }
     const res: any = await api.put(`/assets/${editType.value}/${f.id}`, payload)
     const list = assetSections.value.find((x) => x.type === editType.value)?.list || []
