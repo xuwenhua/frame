@@ -704,7 +704,7 @@ const makePanoramaVideo = async (a: any) => {
 // ---------- 资产：编辑 / 删除 / 大图 ----------
 const editOpen = ref(false)
 const editType = ref<'character' | 'scene' | 'item'>('character')
-const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', voiceTone: '', voiceSample: '' })
+const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', identityAnchor: '', voiceTone: '', voiceSample: '' })
 // 音色二选一：文字描述 或 参考音频，两者互斥（同时存在会让描述词和音频位打架）
 const voiceMode = ref<'text' | 'audio'>('text')
 // 切换只是切显示，不清数据 —— 来回切一下不该把填好的东西弄丢。
@@ -737,6 +737,7 @@ const openEdit = (type: 'character' | 'scene' | 'item', a: any) => {
     name: a.name || '',
     imagePrompt: a.imagePrompt || '',
     referenceImage: a.referenceImage || '',
+    identityAnchor: a.identityAnchor || '',
     // 二选一：已经有音频就停在「参考音频」，否则停在「文字描述」
     voiceTone: a.voiceTone || '',
     voiceSample: a.voiceSample || ''
@@ -800,6 +801,8 @@ const saveAsset = async () => {
   editSaving.value = true
   try {
     const payload: Record<string, any> = { name: f.name, imagePrompt: f.imagePrompt }
+    // 身份锚定：视频描述词的「人物」行读的就是它，改年龄必须改这里
+    if (editType.value === 'character') payload.identityAnchor = f.identityAnchor || ''
     if (f.referenceImage) payload.referenceImage = f.referenceImage
     if (editType.value === 'character') {
       // 二选一在保存时落地：只提交当前选中的那一栏，另一栏显式传空清掉
@@ -2112,6 +2115,14 @@ onUnmounted(() => {
                 <label class="ed-field">
                   <span>名称</span>
                   <input v-model="editForm.name" type="text" placeholder="角色 / 场景 / 道具名" />
+                </label>
+                <label v-if="editType === 'character'" class="ed-field">
+                  <span>身份锚定<em class="ed-opt">视频描述词的人物行读这里</em></span>
+                  <input
+                    v-model="editForm.identityAnchor"
+                    type="text"
+                    placeholder="如：男，四十二岁，公立中学资深教师，教龄近二十年"
+                  />
                 </label>
                 <div v-if="editType === 'character'" class="ed-field">
                   <span>音色<em class="ed-opt">二选一：文字描述 或 参考音频</em></span>

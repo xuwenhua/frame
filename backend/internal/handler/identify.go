@@ -278,9 +278,14 @@ type assetPatch struct {
 	ImagePrompt    *string `json:"imagePrompt"`
 	ReferenceImage *string `json:"referenceImage"`
 	PadImage       *string `json:"padImage"`
-	// 角色专属
-	VoiceTone   *string `json:"voiceTone"`
-	VoiceSample *string `json:"voiceSample"`
+	// 角色专属：这几个以前漏了，导致「改了年龄却只改了出图提示词」——
+	// 视频描述词读的是 identityAnchor，两边不一致
+	IdentityAnchor *string `json:"identityAnchor"`
+	CostumePrompt  *string `json:"costumePrompt"`
+	Personality    *string `json:"personality"`
+	AppearanceCues *string `json:"appearanceCues"`
+	VoiceTone      *string `json:"voiceTone"`
+	VoiceSample    *string `json:"voiceSample"`
 }
 
 // UpdateAsset 编辑单个资产：名称 / 出图提示词 / 参考图 / 音色 / 参考音频
@@ -344,6 +349,18 @@ func (h *IdentifyHandler) UpdateAsset(c *gin.Context) {
 			if *req.ReferenceImage != "" {
 				ch.ReferenceNote = "uploaded"
 			}
+		}
+		if req.IdentityAnchor != nil {
+			ch.IdentityAnchor = strings.TrimSpace(*req.IdentityAnchor)
+		}
+		if req.CostumePrompt != nil {
+			ch.CostumePrompt = strings.TrimSpace(*req.CostumePrompt)
+		}
+		if req.Personality != nil {
+			ch.Personality = strings.TrimSpace(*req.Personality)
+		}
+		if req.AppearanceCues != nil {
+			ch.AppearanceCues = strings.TrimSpace(*req.AppearanceCues)
 		}
 		if req.VoiceTone != nil {
 			ch.VoiceTone = strings.TrimSpace(*req.VoiceTone)
