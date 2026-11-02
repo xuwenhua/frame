@@ -171,7 +171,14 @@ const sbRatio = ref<'16:9' | '9:16'>('16:9')
 //   image    场景原图（默认）
 //   panorama 柱形全景图 —— 场景位换成全景图，房间四周都看得到
 //   video    360 全景视频 —— 额外把视频作为参考视频传给 H3（节点 272）
-const sbSceneRef = ref<'image' | 'panorama' | 'video'>('image')
+// 从 localStorage 恢复：刷新后不该退回「场景图」。
+// 优先级：本集分镜记录的值（loadFrames 时会同步覆盖）> 上次选的 > 默认
+const SCENE_REF_KEY = 'frame:sceneRef'
+const savedRef = (localStorage.getItem(SCENE_REF_KEY) || '') as 'image' | 'panorama' | 'video' | ''
+const sbSceneRef = ref<'image' | 'panorama' | 'video'>(
+  savedRef === 'panorama' || savedRef === 'video' || savedRef === 'image' ? savedRef : 'image'
+)
+watch(sbSceneRef, (v) => localStorage.setItem(SCENE_REF_KEY, v))
 const SCENE_REF_OPTIONS: PillOption[] = [
   { value: 'image', label: '场景图', hint: '用场景原图当环境参考（默认）' },
   { value: 'panorama', label: '柱形全景图', hint: '场景位换成全景图，能看到房间四周' },
