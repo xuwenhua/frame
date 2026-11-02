@@ -162,6 +162,20 @@ var RHWorkflows = []RHWorkflowSpec{
 		DefaultAspect: "9:16", DefaultDuration: 3,
 	},
 	{
+		// 多参工作流：9 图 + 3 音频 + **3 个参考视频位**，比 7img 多两路视频。
+		// 时长 1–15 秒走 259，画幅走 252，提示词 263。
+		Name: "minimax-h3-multi", Label: "MiniMax H3 多参生成", Kind: "video",
+		Desc:        "9 图位 + 3 音频 + 3 参考视频；提示词 263、时长 259、画幅 252",
+		PromptNode:  "263",
+		ImageNodes:  []string{"51", "49", "50", "43", "19", "23", "199", "200", "201"},
+		AudioNodes:  []string{"48", "14", "15"},
+		VideoNode:   "27", // 主参考视频位；25/26 暂未使用
+		RequiredImg: 1,
+		AspectNode:  "252", AspectOptions: RHComfyAspectOptions,
+		DurationNode:  "259",
+		DefaultAspect: "9:16", DefaultDuration: 10,
+	},
+	{
 		// 柱形全景图转 360 全景视频。只有一个输入图位（2），
 		// 没有提示词 / 时长 / 画幅节点 —— 这三项留空，BuildRHInputs 就不会硬塞。
 		Name: "panorama-to-360video", Label: "柱形全景图转 360 视频", Kind: "video",
