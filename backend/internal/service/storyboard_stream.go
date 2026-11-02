@@ -490,30 +490,42 @@ func (s *LLMStoryboardService) PlanSeats(ctx context.Context, chars []model.Char
 	}
 
 	var sb strings.Builder
-	sb.WriteString("给下面这些角色各分配一个座位，要求每个座位唯一可指认。\n\n")
-	if len(scenes) > 0 {
-		sb.WriteString("场景布局：\n")
-		for _, sc := range scenes {
-			fmt.Fprintf(&sb, "- %s：%s\n", sc.Name, strings.TrimSpace(sc.SpatialAnchor))
-		}
-		sb.WriteString("\n")
-	}
+	sb.WriteString("看下面这张场景图，先如实说出图里实际存在的椅子：有几把、什么样式（转椅/靠背椅/长椅）、什么颜色材质、分别在房间的什么位置。\n")
+	sb.WriteString("然后给每个角色分配一把，每个角色对应一把，不要重复。\n\n")
 	sb.WriteString("角色：\n")
 	for _, c := range chars {
 		fmt.Fprintf(&sb, "- %s（%s）\n", c.Name, briefIdentity(c.IdentityAnchor))
 	}
-	sb.WriteString("\n座位描述要写成「位置 + 参照物方位」，例如" +
-		"「办公桌靠窗那一侧、离门口最近的那把」。\n")
-	sb.WriteString("**椅子外观只能引用上面场地布局里已经写过的词**：" +
-		"布局里写「两把深灰布面椅」就用「深灰布面椅」；" +
-		"布局里根本没提椅子长什么样，就**只写位置和参照物，不要虚构材质/颜色**" +
-		"（写「木质靠背椅」「皮质转椅」这类凭空出现的描述，会和参考图对不上，模型反而画错）。\n")
+	if len(scenes) > 0 {
+		sb.WriteString("\n场景已有的文字描述（只作参考，以图为准）：\n")
+		for _, sc := range scenes {
+			fmt.Fprintf(&sb, "- %s：%s\n", sc.Name, strings.TrimSpace(sc.SpatialAnchor))
+		}
+	}
+	sb.WriteString("\n座位写法：**位置 + 参照物方位 + 椅子外观**，例如「办公桌靠窗那一侧、离门口最近的那把深灰布面转椅」。\n")
+	sb.WriteString("椅子外观必须是你在这张图里**真的看到的**，不要凭「办公室一般有什么」猜。\n")
 	sb.WriteString("不要用「左边」「右边」—— 画面方向会随机位翻转。\n")
 	sb.WriteString("只输出 JSON，不要解释：{\"老师\":\"办公桌靠窗那一侧、离门口最近的那把深灰布面转椅\",\"学生\":\"...\"}\n")
 
+	// 带上场景图：模型看着图说话，才不会编出「木质靠背椅」这种场景里根本没有的东西
+	var content any = sb.String()
+	for _, sc := range scenes {
+		src := strings.TrimSpace(sc.ReferenceImage)
+		if src == "" {
+			continue
+		}
+		if dataURL, e := InlineImage("", src, 1024); e == nil {
+			content = []aiclient.ContentPart{
+				aiclient.TextPart(sb.String()),
+				aiclient.ImagePart(dataURL),
+			}
+			break
+		}
+	}
+
 	res, err := s.client.Chat(ctx, []aiclient.ChatMessage{
-		{Role: "system", Content: "你是短剧分镜的场记。只输出 JSON。"},
-		{Role: "user", Content: sb.String()},
+		{Role: "system", Content: "你是短剧分镜的场记，擅长看图说话。只输出 JSON。"},
+		{Role: "user", Content: content},
 	}, 0.2, 1200)
 	if err != nil {
 		log.Printf("座位表生成失败（继续用模型自由写法）：%v", err)
@@ -524,18 +536,11 @@ func (s *LLMStoryboardService) PlanSeats(ctx context.Context, chars []model.Char
 	if raw == "" {
 		return nil
 	}
-	raw = strings.TrimSpace(raw)
-	start := strings.Index(raw, "{")
-	end := strings.LastIndex(raw, "}")
-	if start < 0 || end <= start {
-		return nil
-	}
 	out := map[string]string{}
-	if e := json.Unmarshal([]byte(raw[start:end+1]), &out); e != nil {
+	if e := json.Unmarshal([]byte(raw), &out); e != nil {
 		log.Printf("座位表解析失败：%v", e)
 		return nil
 	}
-	// 只保留有内容的
 	clean := map[string]string{}
 	for k, v := range out {
 		if strings.TrimSpace(v) != "" {
