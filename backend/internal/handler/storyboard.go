@@ -418,6 +418,9 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 	var req struct {
 		EpisodeID string `json:"episodeId" binding:"required"`
 		Duration  int    `json:"duration"`
+		// SceneRef 出片时场景用哪份素材（image/panorama/video）。
+		// 在这里定下来，提示词的详略按它写，并记到分镜上供出片时默认使用。
+		SceneRef string `json:"sceneRef"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 episodeId"})
@@ -461,7 +464,7 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 600*time.Second)
 	defer cancel()
 
-	drafts, err := svc.GenerateStream(ctx, ep.ScriptText, chars, scenes, items, req.Duration, send)
+	drafts, err := svc.GenerateStream(ctx, ep.ScriptText, chars, scenes, items, req.Duration, req.SceneRef, send)
 	if err != nil {
 		send(service.StreamEvent{Type: "error", Message: err.Error()})
 		return
@@ -485,6 +488,7 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 		frames = append(frames, model.Storyboard{
 			ID: idgen.New(), EpisodeID: req.EpisodeID, FrameIndex: d.FrameIndex,
 			Text: d.Text, VideoPrompt: d.VideoPrompt,
+			SceneRef:  req.SceneRef,
 			Duration:  float64(d.Duration),
 			RolesJSON: namesJSON(d.Roles), ScenesJSON: scenesJSON(d.Scenes), ItemsJSON: itemsJSON(d.Items),
 			VideoModel: "doubao-seedance-2.0-mini",

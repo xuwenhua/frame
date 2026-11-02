@@ -157,6 +157,12 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 		return
 	}
 
+	// 前端没指定就沿用生成分镜时定下的场景参考 ——
+	// 提示词是按那个选择写的详略，出片换成另一种素材会自相矛盾
+	if strings.TrimSpace(req.SceneRef) == "" {
+		req.SceneRef = board.SceneRef
+	}
+
 	cost := pointCost(h.settingRepo, "points_video", 35)
 
 	// 发给模型的提示词：默认用原文，有参考图时把 @资产名 换成 图N（模型只认图位序号）。

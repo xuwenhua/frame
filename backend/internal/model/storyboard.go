@@ -34,6 +34,10 @@ type Storyboard struct {
 	// 视频生成时进首帧位（51），空间与人物长相都由它锁定 ——
 	// 只靠文字描述的话，模型每次重建房间的位置都不一样，座位会漂。
 	FirstFrameImage string `json:"firstFrameImage"`
+	// SceneRef 这一集出片时场景参考用哪份素材：image / panorama / video。
+	// 生成分镜时定下来，提示词的详略按它写（用全景视频时空间已被锁死，
+	// 就不用再逐条描述家具位置）；生成视频时默认沿用它，也可以临时覆盖。
+	SceneRef  string         `json:"sceneRef"`
 	Duration    float64        `json:"duration"`                     // 视频时长（秒）
 	CreatedAt   time.Time      `json:"createdAt"`
 	UpdatedAt   time.Time      `json:"updatedAt"`

@@ -132,8 +132,30 @@ func expandSystemPrompt() string {
  "opening":"...","visual":"...","end_frame_character":"...","end_frame_env":"...","end_frame_prop":"..."}`
 }
 
-func expandUserPrompt(item OutlineItem, total int, script, prevEnd, baseSituation string) string {
+// sceneRefHint 按场景参考类型告诉模型「空间细节该写多细」。
+//
+// 用 360 视频/全景图时，房间已经被素材锁死，再逐条罗列家具反而会和素材里的
+// 实际布局打架（文字说书架在左、视频里在右，模型只能挑一个）；
+// 用场景原图时只有正前方视角，才需要把家具相对位置写全，帮模型补全画面。
+func sceneRefHint(sceneRef string) string {
+	switch sceneRef {
+	case "video":
+		return "【场景参考】出片时会把「360 全景视频」作为空间参考传给模型，房间的墙面、家具、陈设已由视频锁定。" +
+			"situation 只写「人物在画面哪一侧、坐着还是站着、朝向谁」就够了，" +
+			"不要逐条罗列家具和房间结构 —— 重复描述会和视频里的实际布局打架。"
+	case "panorama":
+		return "【场景参考】出片时用「柱形全景图」当空间参考，房间四周都看得到。" +
+			"situation 写清人物位置和朝向即可，房间细节不用逐条罗列。"
+	default:
+		return "【场景参考】出片时用「场景原图」当参考，只有正前方视角。" +
+			"situation 要把人物站位、朝向以及关键家具的相对位置写清楚，帮模型补全画面。"
+	}
+}
+
+func expandUserPrompt(item OutlineItem, total int, script, prevEnd, baseSituation, sceneRef string) string {
 	var b strings.Builder
+
+	b.WriteString(sceneRefHint(sceneRef) + "\n\n")
 
 	// 上一段的尾帧放在**最前面**：模型对开头最敏感，藏在中间容易被忽略。
 	// 实测就出过这种：段 8 尾帧写「@学生 保持坐姿」，段 9 却写成「站在椅子旁」，
@@ -168,7 +190,7 @@ func (s *LLMStoryboardService) GenerateOne(
 	ctx context.Context,
 	item OutlineItem,
 	total int,
-	script, prevEnd, baseSituation string,
+	script, prevEnd, baseSituation, sceneRef string,
 	chars []model.Character,
 	scenes []model.Scene,
 	items []model.Item,
@@ -179,7 +201,7 @@ func (s *LLMStoryboardService) GenerateOne(
 	}
 	res, err := s.client.Chat(ctx, []aiclient.ChatMessage{
 		{Role: "system", Content: expandSystemPrompt()},
-		{Role: "user", Content: expandUserPrompt(item, total, script, prevEnd, baseSituation)},
+		{Role: "user", Content: expandUserPrompt(item, total, script, prevEnd, baseSituation, sceneRef)},
 	}, 0.5, 12000)
 	if err != nil {
 		return empty, fmt.Errorf("第 %d 段生成失败: %w", item.Index, err)
@@ -203,6 +225,7 @@ func (s *LLMStoryboardService) GenerateStream(
 	scenes []model.Scene,
 	items []model.Item,
 	duration int,
+	sceneRef string,
 	emit func(StreamEvent),
 ) ([]FrameDraft, error) {
 	// 没有可用模型时退回规则引擎（一次性出完）
@@ -238,12 +261,12 @@ func (s *LLMStoryboardService) GenerateStream(
 		// 后面每一段都被要求「学生站在椅子旁」，和上一段尾帧的「保持坐姿」直接打架，
 		// 模型选了这个更强的措辞 —— 段 8 坐着、段 9 又站起来，就是这么来的。
 		// 位置和姿态由 prevEnd 一段段链式传下去，才是唯一真相。
-		d, err := s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", chars, scenes, items)
+		d, err := s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef, chars, scenes, items)
 		if err != nil {
 			// 单段失败重试一次（模型偶发返回半截 JSON）
 			log.Printf("分镜第 %d 段失败，重试一次：%v", item.Index, err)
 			time.Sleep(1500 * time.Millisecond)
-			d, err = s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", chars, scenes, items)
+			d, err = s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef, chars, scenes, items)
 		}
 		if err != nil {
 			log.Printf("分镜第 %d 段连续失败，跳过：%v", item.Index, err)

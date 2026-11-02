@@ -509,7 +509,8 @@ const generateStoryboard = async () => {
     // 前端只负责显示进度 —— 全部完成后统一落库，中途失败不会清掉旧分镜。
     await streamPOST<any>(
       '/storyboard/generate/stream',
-      { episodeId: episodeId.value, duration: sbSeconds.value },
+      // 场景参考在这里就定下来：提示词的详略按它写，并记到分镜上供出片沿用
+      { episodeId: episodeId.value, duration: sbSeconds.value, sceneRef: sbSceneRef.value },
       (ev) => {
         if (ev.type === 'outline') {
           genProgress.value = { done: 0, total: ev.count || 0 }
@@ -528,6 +529,9 @@ const generateStoryboard = async () => {
     await loadFrames()
     activeFrame.value = 0
     step.value = 2
+    // 工具栏显示成这一集实际用的场景参考，避免「显示场景图、实际按全景写的」
+    const firstRef = frames.value[0]?.sceneRef
+    if (firstRef) sbSceneRef.value = firstRef as any
     const n = frames.value.length
     if (warnMsg) {
       toast.warning(`生成 ${n} 段分镜`, warnMsg)
