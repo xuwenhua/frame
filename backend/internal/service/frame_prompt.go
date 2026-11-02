@@ -200,17 +200,30 @@ func frameSceneHeader(d FrameDraft) string {
 
 	// 地点：场景名 + 帧首站位（站位并进这一行，省掉原来的【素材与场景状态】块，
 	// 首帧图也靠这行取人物位置）
-	place := "未指定场景"
-	if len(d.Scenes) > 0 {
-		names := make([]string, 0, len(d.Scenes))
-		for _, sc := range d.Scenes {
-			names = append(names, "@"+sc.Name)
-		}
-		place = strings.Join(names, "、")
-	}
 	sit := strings.TrimSpace(d.Situation)
-	if sit != "" {
-		place += " " + sit
+
+	place := "未指定场景"
+	if d.SceneRef == "video" {
+		// 360 视频模式：房间的家具、陈设全部由参考视频给出，
+		// 地点行只说明「在视频 1 的场景里」+ 人物位置，不再罗列空间细节。
+		place = "在参考视频 1 的场景中"
+		if len(d.Scenes) > 0 {
+			place += "（@" + d.Scenes[0].Name + "）"
+		}
+		if sit != "" {
+			place += " " + sit
+		}
+	} else {
+		if len(d.Scenes) > 0 {
+			names := make([]string, 0, len(d.Scenes))
+			for _, sc := range d.Scenes {
+				names = append(names, "@"+sc.Name)
+			}
+			place = strings.Join(names, "、")
+		}
+		if sit != "" {
+			place += " " + sit
+		}
 	}
 	// 多人同场时补一句朝向锁定。situation 由 LLM 写，实测它经常只写「谁在画面左侧」
 	// 就收笔，不写两人朝哪边 —— 模型于是按角色参考图把人摆成正对镜头。
@@ -651,6 +664,15 @@ func scenePlace(d FrameDraft) string {
 		return "沿用前序镜头的场景"
 	}
 	sc := d.Scenes[0]
+
+	// 360 视频模式：房间的家具、陈设全部由参考视频给出。
+	// 这里再罗列一遍「左侧靠墙深棕木书架…中央深棕木纹办公桌…」只会和视频里的
+	// 实际排布打架，模型还得判断该信文字还是信视频。只留场景名，加一句
+	// 「在参考视频 1 的场景中」把空间指过去。
+	if d.SceneRef == "video" {
+		return "在参考视频 1 的场景中（@" + sc.Name + "）"
+	}
+
 	out := "@" + sc.Name
 	if a := strings.TrimSpace(sc.SpatialAnchor); a != "" {
 		out += " " + a

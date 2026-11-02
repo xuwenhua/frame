@@ -105,6 +105,7 @@ func (h *StoryboardHandler) Generate(c *gin.Context) {
 	// 补上之后重拼一次（纯函数，代价可忽略）
 	for i := range drafts {
 		drafts[i].EpisodeNo = ep.EpisodeNumber
+		// 描述词按场景参考类型拼：video 模式下地点行不写家具
 		drafts[i].VideoPrompt = service.BuildFrameVideoPrompt(drafts[i], drafts[i].Duration)
 	}
 
@@ -476,6 +477,8 @@ func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
 
 	for i := range drafts {
 		drafts[i].EpisodeNo = ep.EpisodeNumber
+		// 描述词按场景参考类型拼：video 模式下地点行不写家具
+		drafts[i].SceneRef = req.SceneRef
 		drafts[i].VideoPrompt = service.BuildFrameVideoPrompt(drafts[i], drafts[i].Duration)
 	}
 
