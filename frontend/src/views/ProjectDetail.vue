@@ -859,7 +859,11 @@ const ffRefreshing = computed(() => !!activeGroup.value && isFfBusy(activeGroup.
 const hasMedia = computed(() => {
   const f = activeFrameData.value
   if (!f) return false
-  return !!f.videoUrl || isTaskRunning(taskOf(f.id)) || !!activeGroup.value?.image
+  return (
+    !!f.videoUrl ||
+    isTaskRunning(taskOf(f.id)) ||
+    (ffEnabled.value && !!activeGroup.value?.image)
+  )
 })
 
 const planFirstFrames = async () => {
@@ -1750,7 +1754,9 @@ onUnmounted(() => {
                     <span>生成中 {{ taskOf(activeFrameData.id)?.progress || 0 }}%</span>
                   </div>
 
-                  <div v-if="activeGroup?.image || ffRefreshing" class="fd-ff">
+                  <!-- 首帧参考图已下线（ffEnabled=false），这块不再显示；
+                       代码保留，和「首帧规划/首帧图」按钮用同一个开关 -->
+                  <div v-if="ffEnabled && (activeGroup?.image || ffRefreshing)" class="fd-ff">
                     <div class="fd-ff-head">
                       <span>场景全景参考</span>
                       <span class="fd-ff-note">{{ ffRefreshing ? '正在生成…' : coverText(activeGroup) }}</span>
