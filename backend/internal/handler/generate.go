@@ -801,13 +801,18 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard, sceneRef string
 	// 为什么不再传场景资产图：同一间房的两个版本（一个空房、一个有人的定稿），
 	// 模型会纠结以谁为准；首帧图已经锁死了布局、光线和家具位置。
 	hasFirstFrame := false
-	if u := strings.TrimSpace(board.FirstFrameImage); usable(u) {
-		name := sceneName
-		if name == "" {
-			name = "场景"
+	// 选 360 全景视频时连首帧图也不传：首帧图本质还是「一张房间图」，
+	// 留着它，提示词里 <Picture 1> 又会被写成「教师办公室-白天」，
+	// 等于场景图以另一种形式混了进来，和全景视频仍是两套空间参考。
+	if sceneRef != "video" {
+		if u := strings.TrimSpace(board.FirstFrameImage); usable(u) {
+			name := sceneName
+			if name == "" {
+				name = "场景"
+			}
+			push(stripQuery(u), name, "scene")
+			hasFirstFrame = true
 		}
-		push(stripQuery(u), name, "scene")
-		hasFirstFrame = true
 	}
 
 	// 角色优先（说话视频靠角色形象驱动），再场景，最后道具。
