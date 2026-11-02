@@ -152,10 +152,26 @@ func sceneRefHint(sceneRef string) string {
 	}
 }
 
-func expandUserPrompt(item OutlineItem, total int, script, prevEnd, baseSituation, sceneRef string) string {
+func expandUserPrompt(item OutlineItem, total int, script, prevEnd, baseSituation, sceneRef string, scenes []model.Scene) string {
 	var b strings.Builder
 
 	b.WriteString(sceneRefHint(sceneRef) + "\n\n")
+
+	// 把场景的空间布局喂进去：只要求「写绝对位置」但模型不知道书架在哪边，
+	// 它就只能写「画面左侧」—— 而画面左右随机位翻转，过肩一反打就全反了。
+	if len(scenes) > 0 {
+		b.WriteString("【场景布局参考】写站位时用这里的绝对位置（哪一侧有什么），不要写「画面左/右」：\n")
+		for _, sc := range scenes {
+			anchor := strings.TrimSpace(sc.SpatialAnchor)
+			if anchor == "" {
+				anchor = sc.Name
+			}
+			fmt.Fprintf(&b, "- %s：%s\n", sc.Name, anchor)
+			b.WriteString("注意：过肩镜头里那个「背对镜头、只露出肩部」的人，仍然坐在原来的座位上，" +
+				"前景/背景只是构图，不代表他换了位置。写站位时按座位写，不要按画面里的前后左右写。\n")
+		}
+		b.WriteString("\n")
+	}
 
 	// 上一段的尾帧放在**最前面**：模型对开头最敏感，藏在中间容易被忽略。
 	// 实测就出过这种：段 8 尾帧写「@学生 保持坐姿」，段 9 却写成「站在椅子旁」，
@@ -201,7 +217,7 @@ func (s *LLMStoryboardService) GenerateOne(
 	}
 	res, err := s.client.Chat(ctx, []aiclient.ChatMessage{
 		{Role: "system", Content: expandSystemPrompt()},
-		{Role: "user", Content: expandUserPrompt(item, total, script, prevEnd, baseSituation, sceneRef)},
+		{Role: "user", Content: expandUserPrompt(item, total, script, prevEnd, baseSituation, sceneRef, scenes)},
 	}, 0.5, 12000)
 	if err != nil {
 		return empty, fmt.Errorf("第 %d 段生成失败: %w", item.Index, err)
