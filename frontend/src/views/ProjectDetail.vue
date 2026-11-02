@@ -1850,11 +1850,35 @@ onUnmounted(() => {
               </div>
               <div class="side-group">
                 <div class="sg-title"><span class="dot scene"></span>场景</div>
+                <!-- 场景素材跟着「场景参考」走：选了全景/360 就显示对应素材，
+                     否则用户看到的图和实际喂给模型的不是同一个东西 -->
                 <div v-for="s in assets.scenes" :key="s.id" class="side-item">
-                  <img v-if="s.referenceImage" class="si-thumb" :src="s.referenceImage" alt="" />
+                  <video
+                    v-if="sbSceneRef === 'video' && s.panoramaVideo"
+                    class="si-thumb si-video"
+                    :src="s.panoramaVideo"
+                    muted
+                    playsinline
+                    preload="metadata"
+                    title="360 全景视频（悬停播放）"
+                    @mouseenter="(e: any) => (e.target as HTMLVideoElement).play()"
+                    @mouseleave="(e: any) => (e.target as HTMLVideoElement).pause()"
+                  ></video>
+                  <img
+                    v-else-if="sbSceneRef === 'panorama' && s.panoramaImage"
+                    class="si-thumb"
+                    :src="s.panoramaImage"
+                    alt=""
+                    title="柱形全景图"
+                  />
+                  <img v-else-if="s.referenceImage" class="si-thumb" :src="s.referenceImage" alt="" />
                   <div class="si-body">
                     <span class="si-name">@{{ s.name }}</span>
-                    <span class="si-desc">{{ s.spatialAnchor }}</span>
+                    <span class="si-desc">
+                      <span v-if="sbSceneRef === 'video' && s.panoramaVideo" class="si-badge">360 视频</span>
+                      <span v-else-if="sbSceneRef === 'panorama' && s.panoramaImage" class="si-badge">全景图</span>
+                      {{ s.spatialAnchor }}
+                    </span>
                   </div>
                 </div>
                 <div v-if="!assets.scenes.length" class="side-empty">无</div>
@@ -3274,4 +3298,18 @@ onUnmounted(() => {
   .scene-main .asset-thumb { padding-top: 75%; }
 }
 
+.si-video {
+  object-fit: cover;
+  background: #000;
+}
+.si-badge {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(75, 139, 245, 0.16);
+  color: #7aa7ff;
+  font-size: 10px;
+  line-height: 15px;
+}
 </style>
