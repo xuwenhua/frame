@@ -697,7 +697,7 @@ const makePanoramaVideo = async (a: any) => {
 // ---------- 资产：编辑 / 删除 / 大图 ----------
 const editOpen = ref(false)
 const editType = ref<'character' | 'scene' | 'item'>('character')
-const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', voiceTone: '' })
+const editForm = ref<any>({ id: '', name: '', imagePrompt: '', referenceImage: '', voiceTone: '', voiceSample: '' })
 const editSaving = ref(false)
 const uploading = ref(false)
 const viewerSrc = ref('')
@@ -723,7 +723,8 @@ const openEdit = (type: 'character' | 'scene' | 'item', a: any) => {
     name: a.name || '',
     imagePrompt: a.imagePrompt || '',
     referenceImage: a.referenceImage || '',
-    voiceTone: a.voiceTone || ''
+    voiceTone: a.voiceTone || '',
+    voiceSample: a.voiceSample || ''
   }
   editOpen.value = true
 }
@@ -749,6 +750,33 @@ const uploadRef = async (e: Event) => {
   }
 }
 
+/** 触发隐藏的 file input（模板里不能直接用 document） */
+const pickVoiceFile = () => {
+  const el = document.getElementById('voice-file-input') as HTMLInputElement | null
+  el?.click()
+}
+
+/** 上传音色样本：mp3/wav/m4a，最长 15 秒（上传接口已按扩展名限制 30MB） */
+const uploadVoice = async (e: Event) => {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  uploading.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('kind', 'audio')
+    const res: any = await api.post('/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+    editForm.value.voiceSample = res.data?.url || ''
+    toast.success('已上传音色样本', '点保存生效')
+  } catch (err: any) {
+    toast.error('上传失败', err.response?.data?.message || err.message)
+  } finally {
+    uploading.value = false
+    input.value = ''
+  }
+}
+
 const saveAsset = async () => {
   const f = editForm.value
   if (!f.id || editSaving.value) return
@@ -757,7 +785,11 @@ const saveAsset = async () => {
   try {
     const payload: Record<string, any> = { name: f.name, imagePrompt: f.imagePrompt }
     if (f.referenceImage) payload.referenceImage = f.referenceImage
-    if (editType.value === 'character') payload.voiceTone = f.voiceTone
+    if (editType.value === 'character') {
+      payload.voiceTone = f.voiceTone
+      // 空串也要传：用户删掉音频时要能真正清空
+      payload.voiceSample = f.voiceSample || ''
+    }
     const res: any = await api.put(`/assets/${editType.value}/${f.id}`, payload)
     const list = assetSections.value.find((x) => x.type === editType.value)?.list || []
     const hit = list.find((x: any) => x.id === f.id)
@@ -2055,6 +2087,39 @@ onUnmounted(() => {
                   <span>音色描述</span>
                   <input v-model="editForm.voiceTone" type="text" placeholder="如：沉稳中年女音，中低音域，语速中等偏慢" />
                 </label>
+                <div v-if="editType === 'character'" class="ed-field">
+                  <span>音色样本<em class="ed-opt">可选，最长 15 秒</em></span>
+                  <div class="voice-row">
+                    <input
+                      id="voice-file-input"
+                      type="file"
+                      accept="audio/*"
+                      style="display: none"
+                      @change="uploadVoice"
+                    />
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-sm"
+                      :disabled="uploading"
+                      @click="pickVoiceFile"
+                    >
+                      {{ uploading ? '上传中…' : '选择音频' }}
+                    </button>
+                    <audio v-if="editForm.voiceSample" :src="editForm.voiceSample" controls class="voice-audio"></audio>
+                    <span v-else class="ed-hint">未上传 · 会用上面的文字描述配音</span>
+                    <button
+                      v-if="editForm.voiceSample"
+                      type="button"
+                      class="icon-btn danger"
+                      title="移除音色样本"
+                      @click="editForm.voiceSample = ''"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" width="12" height="12">
+                        <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -3469,5 +3534,26 @@ onUnmounted(() => {
   gap: 8px;
   padding: 12px 18px;
   border-top: 1px solid var(--line, #2a2d34);
+}
+.voice-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.voice-audio {
+  height: 32px;
+  flex: 1;
+  min-width: 160px;
+}
+.ed-hint {
+  font-size: 12px;
+  color: var(--text-dim, #8a8f98);
+}
+.ed-opt {
+  margin-left: 6px;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-dim, #8a8f98);
 }
 </style>
