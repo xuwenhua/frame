@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { toastState, toast, type ToastItem } from '../composables/useToast'
+import { toastState, toast } from '../composables/useToast'
 
 const iconPath: Record<string, string> = {
   success: 'M4.5 12.5 9 17l10.5-10.5',
@@ -66,7 +66,11 @@ const iconPath: Record<string, string> = {
   top: 82px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 9000;
+  /* 必须高于所有弹层：弹窗遮罩 9100、大图查看 9200、确认框 9100。
+     之前是 9000，弹窗一开 toast 就被压到下面看不见了
+     （首帧规划弹窗个子高，顶部正好盖住 toast 的位置）。
+     toast-host 整体 pointer-events: none，浮在最上层也不会挡住弹窗的按钮。 */
+  z-index: 9800;
   display: flex;
   flex-direction: column;
   align-items: center;

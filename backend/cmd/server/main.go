@@ -85,12 +85,17 @@ func main() {
 		storyboardRepo, firstFrameRepo, pointsRepo, settingRepo, q, resultStore.Dir())
 	firstFrameHandler := handler.NewFirstFrameHandler(
 		provider, firstFrameRepo, storyboardRepo, episodeRepo, projectRepo,
-		charRepo, sceneRepo, itemRepo, taskRepo, pointsRepo, settingRepo, q)
+		charRepo, sceneRepo, itemRepo, taskRepo, pointsRepo, settingRepo, q,
+		resultStore.Dir(), cfg.App.FFmpegPath)
 	adminHandler := handler.NewAdminHandler(modelConfigRepo, settingRepo, provider)
 	adminUserHandler := handler.NewAdminUserHandler(userRepo, pointsRepo, projectRepo)
 	uploadHandler := handler.NewUploadHandler(filepath.Join(resultStore.Dir(), "uploads"), "/static/uploads")
 	adminTaskHandler := handler.NewAdminTaskHandler(taskRepo, q)
 	accountHandler := handler.NewAccountHandler(userRepo, pointsRepo, statsRepo)
+	// 成片合成：把一集里已出片的分镜按顺序拼成一条
+	composer := service.NewVideoComposer(cfg.App.FFmpegPath, resultStore.Dir(), resultStore.Prefix())
+	composeHandler := handler.NewComposeHandler(
+		episodeRepo, projectRepo, storyboardRepo, composer, resultStore.Dir())
 
 	// ===== 路由 =====
 	gin.SetMode(cfg.App.Mode)
@@ -159,6 +164,15 @@ func main() {
 									duration = spec.DefaultDuration
 								}
 							}
+							// 画幅同理：模型没写就取工作流默认。
+							// 不兜底的话前端会显示「无画幅」，但实际出片有固定比例
+							// （如 minimax-h3-i2v-7img 的 115 节点默认 9:16），
+							// 用户看不到真实情况，容易以为是横屏。
+							if aspect == "" {
+								if spec := service.RHWorkflowByName(p.Workflow); spec != nil {
+									aspect = spec.DefaultAspect
+								}
+							}
 						}
 					}
 					out = append(out, gin.H{
@@ -219,6 +233,8 @@ func main() {
 				episodes.GET("/:id", episodeHandler.Get)
 				episodes.PUT("/:id/script", episodeHandler.UpdateScript)
 				episodes.PUT("/:id/config", episodeHandler.UpdateConfig)
+				// 整集合成：把已出片的分镜按 frame_index 顺序拼成一条完整视频
+				episodes.POST("/:id/compose", composeHandler.Compose)
 			}
 
 			// 识别
@@ -233,6 +249,8 @@ func main() {
 			{
 				storyboard.GET("", storyboardHandler.List)
 				storyboard.POST("/generate", storyboardHandler.Generate)
+				// 逐段生成 + SSE：先出大纲，再一段段推给前端
+				storyboard.POST("/generate/stream", storyboardHandler.GenerateStream)
 				storyboard.PUT("/:id", storyboardHandler.Update)
 				storyboard.DELETE("/:id", storyboardHandler.DeleteFrame)
 				storyboard.POST("/:id/regenerate", storyboardHandler.Regenerate)
@@ -269,6 +287,9 @@ func main() {
 				gen.POST("/image", generateHandler.GenerateImage)
 				gen.POST("/images", generateHandler.BatchGenerateImages)
 				gen.POST("/video", generateHandler.GenerateVideo)
+				// 场景全景：先转柱形全景图，再转 360 视频
+				gen.POST("/panorama", generateHandler.GeneratePanorama)
+				gen.POST("/panorama-video", generateHandler.GeneratePanoramaVideo)
 			}
 
 			// 任务
@@ -591,5 +612,83 @@ func registerQueueHandlers(q *queue.Queue, db *gorm.DB, modelRepo *repository.Mo
 			}
 		}
 		return gen.Generate(ctx, prompt, refImages)
+	})
+
+	// 场景 → 柱形全景图（equirectangular 2:1）。
+	// 用图片编辑模型把单视角场景图补成 360 度全景，左右两端要能无缝接上 —— 后面转 360 视频全靠它。
+	q.Register("panorama", func(ctx context.Context, task *model.GenerationTask) (string, string, error) {
+		cfg, err := modelRepo.GetByID(task.ModelID)
+		if err != nil || cfg == nil {
+			return "", "", errors.New("未配置图片编辑模型，请到管理端添加")
+		}
+		var refs []string
+		aspect := ""
+		if task.Params != "" {
+			var p struct {
+				RefImages []string `json:"refImages"`
+				Aspect    string   `json:"aspect"`
+			}
+			if json.Unmarshal([]byte(task.Params), &p) == nil {
+				refs = p.RefImages
+				aspect = p.Aspect
+			}
+		}
+		if len(refs) == 0 {
+			return "", "", errors.New("缺少场景图，无法扩展成全景")
+		}
+		// 画幅必须覆盖模型默认值：qwen-image 默认 9:16，直接用会出竖图，
+		// 竖图转 360 时整个房间被拉成一条。
+		if aspect != "" {
+			merged := map[string]interface{}{}
+			if cfg.Params != "" {
+				_ = json.Unmarshal([]byte(cfg.Params), &merged)
+			}
+			merged["aspectRatio"] = aspect
+			if raw, e := json.Marshal(merged); e == nil {
+				cp := *cfg
+				cp.Params = string(raw)
+				cfg = &cp
+			}
+		}
+		gen := service.NewImageGenerator(cfg)
+		gen.LocalRoot = resultStore.Dir()
+		gen.OnExternalTaskID = func(extID string) {
+			if err := db.Model(&model.GenerationTask{}).Where("id = ?", task.ID).
+				Update("external_task_id", extID).Error; err != nil {
+				log.Printf("写入上游任务 ID 失败 %s: %v", task.ID, err)
+			}
+		}
+		gen.ExistingTaskID = task.ExternalTaskID
+		return gen.GenerateWithRefs(ctx, task.Prompt, refs)
+	})
+
+	// 柱形全景图 → 360 全景视频（panorama-to-360video 工作流）。
+	// 这个工作流只有图位 2、没有提示词/时长/画幅节点，所以 prompt 传空、只给图。
+	q.Register("panorama_video", func(ctx context.Context, task *model.GenerationTask) (string, string, error) {
+		cfg, err := modelRepo.GetByID(task.ModelID)
+		if err != nil || cfg == nil {
+			return "", "", errors.New("未配置全景视频工作流，请到管理端添加")
+		}
+		var refs []string
+		if task.Params != "" {
+			var p struct {
+				RefImages []string `json:"refImages"`
+			}
+			if json.Unmarshal([]byte(task.Params), &p) == nil {
+				refs = p.RefImages
+			}
+		}
+		if len(refs) == 0 {
+			return "", "", errors.New("缺少柱形全景图，请先生成全景图")
+		}
+		gen := service.NewVideoGenerator(cfg)
+		gen.LocalRoot = resultStore.Dir()
+		gen.OnExternalTaskID = func(extID string) {
+			if err := db.Model(&model.GenerationTask{}).Where("id = ?", task.ID).
+				Update("external_task_id", extID).Error; err != nil {
+				log.Printf("写入上游任务 ID 失败 %s: %v", task.ID, err)
+			}
+		}
+		return gen.Generate(ctx, "", refs)
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -148,6 +149,18 @@ func (h *StoryboardHandler) Generate(c *gin.Context) {
 		resp["warning"] = llmErr.Error()
 	}
 
+	// 台词忠实度校验：剧本里写死的对白有没有被漏掉、重复、或拆到两段。
+	// 只报不拦 —— 自动改台词的风险比漏一句更高，交给用户判断。
+	if issues := service.DialogueIssues(frames, ep.ScriptText); len(issues) > 0 {
+		msg := "台词校验：" + strings.Join(issues, "；")
+		if prev, ok := resp["warning"].(string); ok && prev != "" {
+			resp["warning"] = prev + "；" + msg
+		} else {
+			resp["warning"] = msg
+		}
+		log.Printf("分镜台词校验发现 %d 个问题：%v", len(issues), issues)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "分镜生成成功", "data": resp})
 }
 
@@ -188,15 +201,15 @@ func (h *StoryboardHandler) Update(c *gin.Context) {
 	// 全部用指针：只覆盖请求里出现的字段。
 	// 否则「只改出镜人物」的请求会把文案和描述词一起清空（资产编辑踩过同样的坑）。
 	var req struct {
-		Text        *string          `json:"text"`
-		VideoPrompt *string          `json:"videoPrompt"`
+		Text        *string           `json:"text"`
+		VideoPrompt *string           `json:"videoPrompt"`
 		Roles       *[]model.AssetRef `json:"roles"`
 		Scenes      *[]model.AssetRef `json:"scenes"`
 		Items       *[]model.AssetRef `json:"items"`
-		VideoModel  *string          `json:"videoModel"`
-		VideoURL    *string          `json:"videoUrl"`
+		VideoModel  *string           `json:"videoModel"`
+		VideoURL    *string           `json:"videoUrl"`
 		// Duration 这一帧的出片时长（秒），工具栏「批量应用」会逐帧写
-		Duration    *float64         `json:"duration"`
+		Duration *float64 `json:"duration"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "参数错误"})
@@ -229,6 +242,13 @@ func (h *StoryboardHandler) Update(c *gin.Context) {
 	}
 	if req.Duration != nil {
 		f.Duration = *req.Duration
+		// 只改时长、没同时给新描述词时，必须把描述词里的时间轴一起缩放。
+		// 否则出现「卡片显示 13 秒、描述词写 0.00–3.00s」：出片时传给时长节点
+		// 的是 Duration，模型会把 3 秒的动作硬拉成 13 秒，后半段基本静止 ——
+		// 用户看到的是「模型不动了」，其实是提示词和时长脱节。
+		if req.VideoPrompt == nil && f.VideoPrompt != "" && *req.Duration > 0 {
+			f.VideoPrompt = service.RescalePromptDuration(f.VideoPrompt, int(*req.Duration))
+		}
 	}
 	if req.VideoURL != nil {
 		// 视频地址只允许空值 / 本站静态路径 / 外链，防止注入
@@ -387,3 +407,104 @@ func itemsJSON(v []model.Item) string {
 }
 
 var _ = errors.Is
+
+// GenerateStream 逐段生成分镜，边生成边用 SSE 推给前端。
+//
+// 为什么单独一个接口：一次性生成时用户只能干等几十秒，
+// 而且写到后面注意力被前面段落挤占、段与段之间衔接差。
+// 逐段生成每段都带上「上一段的尾帧」，位置和姿态是传下去的。
+func (h *StoryboardHandler) GenerateStream(c *gin.Context) {
+	userID := middleware.CurrentUserID(c)
+	var req struct {
+		EpisodeID string `json:"episodeId" binding:"required"`
+		Duration  int    `json:"duration"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 episodeId"})
+		return
+	}
+
+	ep, err := h.ownedEpisode(req.EpisodeID, userID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "剧集不存在"})
+		return
+	}
+	if strings.TrimSpace(ep.ScriptText) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "这一集还没有剧本"})
+		return
+	}
+
+	chars, _ := h.charRepo.ListByEpisodeID(req.EpisodeID)
+	scenes, _ := h.sceneRepo.ListByEpisodeID(req.EpisodeID)
+	items, _ := h.itemRepo.ListByEpisodeID(req.EpisodeID)
+
+	client, _, _ := h.provider.LLM()
+	svc := service.NewLLMStoryboardService(client)
+
+	hdr := c.Writer.Header()
+	hdr.Set("Content-Type", "text/event-stream")
+	hdr.Set("Cache-Control", "no-cache")
+	hdr.Set("Connection", "keep-alive")
+	hdr.Set("X-Accel-Buffering", "no") // 反代（nginx）不要缓冲，否则前端要等一大坨才收到
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "当前服务不支持流式输出"})
+		return
+	}
+	send := func(ev service.StreamEvent) {
+		if b, e := json.Marshal(ev); e == nil {
+			fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 600*time.Second)
+	defer cancel()
+
+	drafts, err := svc.GenerateStream(ctx, ep.ScriptText, chars, scenes, items, req.Duration, send)
+	if err != nil {
+		send(service.StreamEvent{Type: "error", Message: err.Error()})
+		return
+	}
+	if len(drafts) == 0 {
+		send(service.StreamEvent{Type: "error", Message: "剧本太短，无法拆分镜头"})
+		return
+	}
+
+	for i := range drafts {
+		drafts[i].EpisodeNo = ep.EpisodeNumber
+		drafts[i].VideoPrompt = service.BuildFrameVideoPrompt(drafts[i], drafts[i].Duration)
+	}
+
+	// 全部成功后再覆盖旧分镜：中途失败不会把用户原来的分镜清掉
+	_ = h.repo.DeleteByEpisodeID(req.EpisodeID)
+
+	now := time.Now()
+	frames := make([]model.Storyboard, 0, len(drafts))
+	for _, d := range drafts {
+		frames = append(frames, model.Storyboard{
+			ID: idgen.New(), EpisodeID: req.EpisodeID, FrameIndex: d.FrameIndex,
+			Text: d.Text, VideoPrompt: d.VideoPrompt,
+			Duration:  float64(d.Duration),
+			RolesJSON: namesJSON(d.Roles), ScenesJSON: scenesJSON(d.Scenes), ItemsJSON: itemsJSON(d.Items),
+			VideoModel: "doubao-seedance-2.0-mini",
+			CreatedAt:  now, UpdatedAt: now,
+		})
+	}
+	if err := h.repo.CreateBatch(frames); err != nil {
+		send(service.StreamEvent{Type: "error", Message: err.Error()})
+		return
+	}
+
+	ep.Status = "storyboard"
+	ep.UpdatedAt = now
+	_ = h.episodeRepo.Update(ep)
+
+	warning := ""
+	if issues := service.DialogueIssues(frames, ep.ScriptText); len(issues) > 0 {
+		warning = "台词校验：" + strings.Join(issues, "；")
+		log.Printf("分镜台词校验发现 %d 个问题：%v", len(issues), issues)
+	}
+
+	send(service.StreamEvent{Type: "done", Count: len(frames), Message: warning})
+}

@@ -32,16 +32,22 @@ const storyboardSystemPrompt = `你是专业的影视导演。给你剧本，你
 
 严格要求：
 1. 只输出 JSON，不要解释文字、不要 markdown 代码块
-2. **一段只有一个镜头**：shots 数组里只放 1 个元素，这个镜头 2–6 秒。
-   想换景别、换机位、换场景，都**另起一段** —— 一段里塞多个镜头时，
-   模型对段内的切镜时机和台词分配都不稳，实测台词念不完、口型错位都出在多镜段上。
+2. **一段 2–4 个镜头，总时长 8–15 秒**：shots 数组里放 2–4 个元素，每镜 2–6 秒，
+   时间从 0 开始连续累计。镜头之间是「切镜」—— **同一场景、同一站位，
+   只换景别和机位**，不要换场景、不要让人走动换位置。
+   **每个镜头必须写清机位方位**：如「摄影机在 @老师 右肩后方，过肩拍 @学生」
+   「正面中近景」「摄影机在办公桌斜前方」。只写「固定机位」模型不知道从哪拍，
+   切镜点会乱、人物会跳。
+   **一镜一句台词**：一句台词只放在一个镜头里，不许跨镜头；
+   台词多就多给那个镜头时间、或者加一个镜头，不要硬塞。
    **上一段的台词必须说完才能结束**：台词还没念完就结束，
    观众看到的就是口型对不上、话被掐断
 3. 按剧本叙述顺序拆，不要合并或跳过情节。
    剧本里的一段戏，15 秒演不完就顺延到下一段，**不要压缩台词、不要删句子**：
    宁可多拆一段，也不要把 40 个字塞进 15 秒
 4. 一个镜头内景别固定，不要在同一个镜头里换景别
-5. 段数视剧本长度而定，通常比多镜写法更多（8-25 段）；一段对话里有几个人说话就至少拆几段
+5. 段数按「叙事单元」定：一段 = 一个完整的问答、或一个连贯的动作单元（内含 2–4 个镜头），
+   通常 4–8 段。不要一句话一段 —— 碎镜头会让整集人物跟着漂
 6. 所有指代人物、道具的地方必须写成 @角色名 / @道具名（例如 @女主 拿起 @面霜），
    不要写「她」「那个东西」这类代词，也不要写成「女生」「女士」这种泛称
 7. **只能 @输入清单里真实存在的资产名**。剧本里提到但清单里没有的东西，
@@ -74,7 +80,7 @@ const storyboardSystemPrompt = `你是专业的影视导演。给你剧本，你
       "scene_name": "场景名，必须与输入的场景列表完全一致",
       "role_names": ["出场角色名，必须是输入角色列表里的"],
       "item_names": ["出镜道具名，没有就空数组"],
-      "situation": "素材与场景状态：写这一段「开始时」的时间、地点、人物姿态与站位（谁站在哪、谁坐着、手里拿着什么），2-3 句，用 @角色名 指代，说明谁在画面左侧、谁在右侧，**并写明谁面向谁**（如「两人隔着桌子相对而坐，@老师 面向 @学生、@学生 面向 @老师，视线交汇」）。只写起始状态，不要写这一帧里将要发生的动作；不要写服装和发型（有单独的锁定块），避免两处描述不一致",
+      "situation": "素材与场景状态：写这一段「开始时」的时间、地点、人物姿态与站位（谁站在哪、谁坐着、手里拿着什么），2-3 句，用 @角色名 指代。**方位必须写成「（画面左侧）」「（画面右侧）」这种明确的画面方位**，不要用「桌后」「靠窗一侧」「白板那侧」这种相对位置 —— 模型分不清相对位置对应画面哪边，会自己摆。**并写明谁面向谁**（如「两人隔着桌子相对而坐，@老师 面向 @学生、@学生 面向 @老师，视线交汇」）。只写起始状态，不要写这一帧里将要发生的动作；不要写服装和发型（有单独的锁定块），避免两处描述不一致",
       "performance": "各角色的情绪线，用 @名 指代，如「@女主 起始欣喜，被质疑时毫不迟疑」",
       "locking": "整帧不能变的要素：谁始终在画面哪侧、道具最终在谁手上、朝向关系",
       "shots": [
@@ -109,9 +115,11 @@ type llmDialogueRaw struct {
 
 // llmShotRaw LLM 返回的单个镜头
 type llmShotRaw struct {
-	Seconds  int    `json:"seconds"`
-	ShotSize string `json:"shot_size"`
-	Camera   string `json:"camera"`
+	// Seconds 允许小数：参考站的时间轴就有「10–12.5秒」这种，
+	// 用 int 接会直接解析失败（实测第 3 段整段丢掉、台词跟着漏）。
+	Seconds  float64 `json:"seconds"`
+	ShotSize string  `json:"shot_size"`
+	Camera   string  `json:"camera"`
 	// State 这一镜开始时的人物姿态（承接上一镜）
 	State     string           `json:"state"`
 	Action    string           `json:"action"`
@@ -125,20 +133,20 @@ type llmShotRaw struct {
 //   - 新写法：镜头细节放在 shots 数组里（对应参考站的一帧多镜头）
 //   - 旧写法：shot_size/camera/action/dialogues 直接挂在帧上（单镜）
 type llmFrameRaw struct {
-	SceneName         string           `json:"scene_name"`
-	RoleNames         []string         `json:"role_names"`
-	ItemNames         []string         `json:"item_names"`
-	Situation         string           `json:"situation"`
-	Performance       string           `json:"performance"`
-	Locking           string           `json:"locking"`
-	Shots             []llmShotRaw     `json:"shots"`
-	Opening           string           `json:"opening"`
-	Visual            string           `json:"visual"`
-	EndFrameCharacter string           `json:"end_frame_character"`
-	EndFrameEnv       string           `json:"end_frame_env"`
-	EndFrameProp      string           `json:"end_frame_prop"`
-	ShotProgression   string           `json:"shot_progression"`
-	Emotion           string           `json:"emotion"`
+	SceneName         string       `json:"scene_name"`
+	RoleNames         []string     `json:"role_names"`
+	ItemNames         []string     `json:"item_names"`
+	Situation         string       `json:"situation"`
+	Performance       string       `json:"performance"`
+	Locking           string       `json:"locking"`
+	Shots             []llmShotRaw `json:"shots"`
+	Opening           string       `json:"opening"`
+	Visual            string       `json:"visual"`
+	EndFrameCharacter string       `json:"end_frame_character"`
+	EndFrameEnv       string       `json:"end_frame_env"`
+	EndFrameProp      string       `json:"end_frame_prop"`
+	ShotProgression   string       `json:"shot_progression"`
+	Emotion           string       `json:"emotion"`
 	// 旧写法兼容
 	ShotSize  string           `json:"shot_size"`
 	Camera    string           `json:"camera"`
@@ -268,7 +276,7 @@ func (s *LLMStoryboardService) GenerateFrames(
 			}
 		}
 
-		d.Text = composeText(d, f.Opening, f.Visual, f.EndFrameCharacter, f.EndFrameEnv, f.EndFrameProp)
+		// 文案要等台词填完再拼（[视频画面] 里要把对白写进去）
 
 		// 参考站结构的字段：有就用 LLM 的，没有就交给 BuildFrameVideoPrompt 兜底
 		d.Situation = f.Situation
@@ -288,7 +296,7 @@ func (s *LLMStoryboardService) GenerateFrames(
 		// 多镜头：LLM 给 shots 就用它，否则退回首层平铺字段（单镜）
 		for _, sh := range f.Shots {
 			shot := FrameShot{
-				Seconds:  sh.Seconds,
+				Seconds:  secOf(sh.Seconds),
 				ShotSize: sh.ShotSize,
 				Camera:   sh.Camera,
 				State:    sh.State,
@@ -339,6 +347,9 @@ func (s *LLMStoryboardService) GenerateFrames(
 		// 这类 @名 没有对应参考图，必须降级为普通文字，否则前端高亮和参考图会错位。
 		SanitizeMentions(&d, KnownAssetNames(d.Roles, d.Scenes, d.Items))
 
+		// 台词已经填好，现在拼文案：[视频画面] 里动作和台词交织，读起来像一场戏
+		d.Text = composeText(d, f.Opening, f.Visual, f.EndFrameCharacter, f.EndFrameEnv, f.EndFrameProp)
+
 		// 时长：工具栏传的是「单段上限」而不是固定值 ——
 		// 一句「坐。」也按 15 秒出片会拖得没法看。
 		// 先按台词字数与镜头数估算，超上限才截到上限。
@@ -354,7 +365,10 @@ func (s *LLMStoryboardService) GenerateFrames(
 
 	// 先按单帧上限拆超长的，再把「一段多镜」拆成「一段一镜」。
 	// 顺序不能反：先拆成一镜一段的话，单镜超过 15 秒就没法再拆了。
-	return explodeMultiShotFrames(splitOverlongFrames(drafts, duration)), nil
+	// 只按「单段超 15 秒」拆，不再把多镜段强制拆成一镜一段：
+	// 一段里切 2-4 个镜头是做出来的画面层次，拆掉就变成了一个机位干到底。
+	// 前提是每个镜头都写了机位方位（见提示词第 2 条）。
+	return splitOverlongFrames(drafts, duration), nil
 }
 
 // explodeMultiShotFrames 把「一段多镜」拆成「一段一镜」。
@@ -521,7 +535,30 @@ func composeText(d FrameDraft, opening, visual, endChar, endEnv, endProp string)
 	}
 
 	fmt.Fprintf(&b, "[开场站位]：%s\n", fallbackText(opening, "环境空镜起幅"))
-	fmt.Fprintf(&b, "[视频画面]：%s\n", fallbackText(visual, "延续前一镜动作"))
+
+	// [视频画面] 里把台词也写进去：文案是给人读的，只有动作没有对白
+	// 读起来就是干巴巴的说明，也看不出这一段到底在聊什么。
+	// 台词来源仍只有 dialogues 一处，这里只是拼给人看，不额外造文本。
+	visualText := strings.TrimRight(fallbackText(visual, "延续前一镜动作"), "。；")
+	var said strings.Builder
+	for _, dl := range d.Dialogues {
+		line := strings.TrimSpace(dl.Line)
+		if line == "" {
+			continue
+		}
+		role := fallbackText(dl.Role, "角色")
+		cue := strings.TrimSpace(dl.Tone)
+		if cue == "" {
+			cue = "语气自然"
+		}
+		said.WriteString(fmt.Sprintf("。@%s %s地说：“%s”", role, cue, line))
+	}
+	if said.Len() > 0 {
+		visualText += said.String() + "。"
+	} else if visualText != "" {
+		visualText += "。"
+	}
+	fmt.Fprintf(&b, "[视频画面]：%s\n", visualText)
 
 	fmt.Fprintf(&b, "[尾帧画面]：[人物状态] %s；[环境状态] %s；[关键道具] %s",
 		fallbackText(endChar, "情绪收束"),
@@ -615,4 +652,14 @@ func retryableLLMErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// secOf 小数秒转整数秒（2.5 → 3）。
+// 参考站允许 2.5 秒这种时间轴，我们内部用整数秒，这里只做四舍五入；
+// 纯动作镜头的时长下限由 planShotSeconds 兜底，不在这里裁剪。
+func secOf(v float64) int {
+	if v <= 0 {
+		return 0
+	}
+	return int(v + 0.5)
 }

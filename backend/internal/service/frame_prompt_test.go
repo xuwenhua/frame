@@ -71,22 +71,21 @@ func sampleMultiShotDraft() FrameDraft {
 func TestBuildFrameVideoPromptStructure(t *testing.T) {
 	got := BuildFrameVideoPrompt(sampleDraft(), 10)
 
-	// H3 官方结构：场次/地点/时间/人物/声音 + 每镜【Shot N｜起止秒｜景别·主体】五段子项
+	// 分镜脚本字段格式：场次/地点/时间/人物/物品 + 每镜 镜号/景别/运镜/情绪动作/台词/音效/时长
 	order := []string{
 		"场次：1-1",
 		"地点：@家居客厅-白天",
-		"时间：日 / 内",
+		"时间：白天",
 		"人物：@女主",
-		"声音：@女主 (S1)",
-		"[Shot 1] 0.00–",
-		"s，双人中景，主体 @女主",
-		"【主体】@女主 为主体",
-		"【动作】",
-		"(S1) @女主 <d>[Chinese]",
-		"【镜头】双人中景",
-		"【音效】",
-		"【约束】",
-		"【全片约束】",
+		"物品：@面霜",
+		"镜号：1",
+		"景别：双人中景",
+		"运镜：",
+		"情绪/动作：",
+		"台词：@女主",
+		"音效：",
+		"时长：",
+		"【执行要点】",
 	}
 	pos := -1
 	for _, seg := range order {
@@ -109,7 +108,7 @@ func TestBuildFrameVideoPromptMultiShotTimeline(t *testing.T) {
 	if len(blocks) != 3 {
 		t.Fatalf("应拆出 3 个镜头块，实际 %d\n%s", len(blocks), got)
 	}
-	for i, want := range []string{"[Shot 1] 0.00–", "[Shot 2] ", "[Shot 3] "} {
+	for i, want := range []string{"镜号：1", "镜号：2", "镜号：3"} {
 		if !strings.Contains(blocks[i], want) {
 			t.Errorf("第 %d 块缺少 %q\n%s", i+1, want, blocks[i])
 		}
@@ -148,29 +147,31 @@ func TestBuildFrameVideoPromptKeepsDialogueDuration(t *testing.T) {
 func TestBuildFrameVideoPromptCastList(t *testing.T) {
 	got := BuildFrameVideoPrompt(sampleDraft(), 10)
 	for _, want := range []string{
-		"人物：@女主（女性，28岁）；@男主（男性，30岁）",
+		"人物：@女主（女性，28岁）",
 		"地点：@家居客厅-白天",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("缺少 %q\n---\n%s", want, got)
 		}
 	}
-	// 站位并进地点行，首帧图靠它取人物位置
-	if !strings.Contains(got, "坐在沙发靠茶几的一端") {
-		t.Errorf("地点行没带上站位描述：\n%s", got)
+	// 地点行带上场景的空间布局，模型据此摆家具
+	if !strings.Contains(got, "浅灰布艺沙发与木质茶几") {
+		t.Errorf("地点行没带上空间描述：\n%s", got)
 	}
 }
 
 func TestBuildFrameVideoPromptKeepsDialogue(t *testing.T) {
 	got := BuildFrameVideoPrompt(sampleDraft(), 10)
 	// 台词走 H3 官方标记：<d>[Chinese] 正文</d>，前面带 (S1) 说话人标记
-	want := "(S1) @女主 <d>[Chinese] 这个面霜真的好用，我用了一个月，皮肤白了一个度。</d>"
-	if !strings.Contains(got, want) {
-		t.Errorf("台词被改写或丢了标点，期望 %q:\n%s", want, got)
+	if !strings.Contains(got, "台词：@女主（满带欣喜") {
+		t.Errorf("台词语气丢了:\n%s", got)
 	}
-	// 声音设定要把「谁 = 哪个标记 = 什么音色」写死
-	if !strings.Contains(got, "声音：@女主 (S1) 亲切年轻女音") {
-		t.Errorf("缺少声音设定行:\n%s", got)
+	if want := "<d>[Chinese] 这个面霜真的好用，我用了一个月，皮肤白了一个度。</d>"; !strings.Contains(got, want) {
+		t.Errorf("台词正文被改写或丢了标点，期望 %q:\n%s", want, got)
+	}
+	// 音色写在人物行里（示例是「音色参考@音频1」，我们没有音频资产，用文字音色）
+	if !strings.Contains(got, "人物：@女主（女性，28岁），亲切年轻女音") {
+		t.Errorf("人物行没带音色:\n%s", got)
 	}
 	// 解析回读时不能把 <d> 标签当台词
 	lines := ParsePromptDialogues(got)
@@ -193,11 +194,12 @@ func TestBuildFrameVideoPromptOmitsEmpty(t *testing.T) {
 	d.Dialogues = nil
 	d.SFX = ""
 	got := BuildFrameVideoPrompt(d, 5)
-	if !strings.Contains(got, "本镜无台词，不要开口") {
+	if !strings.Contains(got, "台词：无") {
 		t.Errorf("没有台词时应明确「本镜无台词」:\n%s", got)
 	}
-	if !strings.Contains(got, "【音效】无") {
-		t.Errorf("没有音效时应写「【音效】无」:\n%s", got)
+	// 参考站格式不占位：没音效就不写这一行
+	if strings.Contains(got, "【音效】：") {
+		t.Errorf("没有音效时不该输出【音效】行:\n%s", got)
 	}
 }
 
@@ -482,7 +484,7 @@ func TestRewriteMentionsForModel(t *testing.T) {
 	for _, want := range []string{
 		"<Picture 1> 是「老师」",
 		"<Picture 2> 是「学生」",
-		"<Picture 3> 是「公司会议室-白天」：只参考空间结构",
+		"<Picture 3> 是「公司会议室-白天」：空间结构、家具布局、光线方向",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("subject_definitions 缺少 %q：\n%s", want, out)
@@ -519,7 +521,7 @@ func min(a, b int) int {
 func TestPromptHasLipSyncRule(t *testing.T) {
 	got := BuildFrameVideoPrompt(sampleDraft(), 0)
 	for _, want := range []string{
-		"念完才切下一个 Shot",
+		"念完才切下一个镜头",
 		"只有正在说话的角色动嘴，其他人闭口",
 	} {
 		if !strings.Contains(got, want) {
@@ -533,7 +535,7 @@ func TestPromptHasLipSyncRule(t *testing.T) {
 // 短句（1 个字分到 2 秒）算出来 0.5 字/秒，它会把那个字拖满整镜。
 func TestPromptCarriesSpeechRate(t *testing.T) {
 	got := BuildFrameVideoPrompt(sampleDraft(), 0)
-	if !strings.Contains(got, "语速平稳地说") {
+	if !strings.Contains(got, "语速平稳") {
 		t.Fatalf("缺少语速提示：\n%s", got)
 	}
 	if strings.Contains(got, "字/秒") {
@@ -549,6 +551,7 @@ func TestPromptCarriesSpeechRate(t *testing.T) {
 // （实测「抬手示意他坐」被提前到第 0 秒做完，台词说「坐」时人已经坐好了）
 func TestPromptTiesActionToDialogueTiming(t *testing.T) {
 	d := FrameDraft{
+		Roles: []model.Character{{Name: "老师"}},
 		Shots: []FrameShot{{
 			ShotSize:  "双人中景",
 			Action:    "说到「坐」时抬手示意对方落座",
@@ -557,13 +560,13 @@ func TestPromptTiesActionToDialogueTiming(t *testing.T) {
 	}
 	got := BuildFrameVideoPrompt(d, 9)
 
-	// 动作在【动作】行，时序约束在【全片约束】和第一个 Shot 的【约束】里
-	if !strings.Contains(got, "【动作】说到「坐」时抬手示意对方落座") {
-		t.Errorf("动作没写进【动作】行：\n%s", got)
+	// 动作直接写在镜头头下面（参考站格式，不再套【动作】标签）
+	if !strings.Contains(got, "说到「坐」时抬手示意对方落座") {
+		t.Errorf("动作丢失：\n%s", got)
 	}
 	for _, want := range []string{
-		"台词里要求的动作（如「坐」「过来」）说到时才发生，不得提前",
-		"人物位置按【主体】里的站位，全程不换座",
+		"说到时才发生，不得提前",
+		"全程不换座",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("缺少时序约束 %q：\n%s", want, got)
@@ -604,7 +607,7 @@ func TestCharacterBriefInHeader(t *testing.T) {
 	got := BuildFrameVideoPrompt(d, 6)
 
 	// 新格式不再写人物锁定长段：外观交给参考图，文字只留一句身份
-	if !strings.Contains(got, "人物：@老师（女性，38岁，生涯规划老师）") {
+	if !strings.Contains(got, "人物：@老师（女性，38岁）") {
 		t.Errorf("人物行没带身份：\n%s", got)
 	}
 	if strings.Contains(got, "【人物锁定】") {
@@ -622,8 +625,10 @@ func shotBlocksOf(vp string) []string {
 	started := false
 	for _, line := range strings.Split(vp, "\n") {
 		t := strings.TrimSpace(line)
-		// 官方时间轴镜头头：[Shot 1] 0.00–2.00s，…
-		if strings.HasPrefix(t, "[Shot ") {
+		// 镜头头有两种写法：
+		//   新格式（参考站风格）|镜头1| 0-5秒| 双人中景|
+		//   旧格式（Ref2VA）    [Shot 1] 0.00–2.00s，…
+		if strings.HasPrefix(t, "[Shot ") || strings.HasPrefix(t, "|镜头") || strings.HasPrefix(t, "镜号：") {
 			if started {
 				out = append(out, cur.String())
 			}
@@ -642,13 +647,25 @@ func shotBlocksOf(vp string) []string {
 
 // shotSecondsOf 取一个镜头块的长度：从【Shot N｜a–b秒｜…】里的起止秒算
 func shotSecondsOf(block string) int {
-	re := regexp.MustCompile(`\[Shot\s*\d+\]\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*s`)
+	// 当前格式把时长单列一行：时长：6s
+	if m := regexp.MustCompile(`(?m)^时长：\s*(\d+)\s*s`).FindStringSubmatch(block); len(m) > 1 {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	// 兼容两种紧凑镜头头写法，见 shotBlocksOf
+	re := regexp.MustCompile(`\[Shot\s*\d+\]\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*s|\|镜头\s*\d+\|\s*([\d.]+)\s*[-–—~～至]\s*([\d.]+)\s*秒`)
 	m := re.FindStringSubmatch(block)
-	if len(m) < 3 {
+	if len(m) < 5 {
 		return 0
 	}
-	start, _ := strconv.ParseFloat(m[1], 64)
-	end, _ := strconv.ParseFloat(m[2], 64)
+	var start, end float64
+	if m[1] != "" {
+		start, _ = strconv.ParseFloat(m[1], 64)
+		end, _ = strconv.ParseFloat(m[2], 64)
+	} else {
+		start, _ = strconv.ParseFloat(m[3], 64)
+		end, _ = strconv.ParseFloat(m[4], 64)
+	}
 	if end <= start {
 		return 0
 	}
@@ -728,5 +745,109 @@ func TestEnsureSpeechRateFillsOldPrompt(t *testing.T) {
 	// 新格式已有语气行，原样返回（不能重复插入）
 	if again := EnsureSpeechRate(got); again != got {
 		t.Errorf("重复调用改动了文本：\n%s", again)
+	}
+}
+
+// 改时长后描述词时间轴必须跟着缩放，否则「卡片 13 秒 / 描述词 3 秒」脱节。
+func TestRescalePromptDuration(t *testing.T) {
+	single := `场次：1-1
+地点：现代家居客厅-白天
+
+summary:
+Ref2VA 目标视频：第 1-1 场，现代家居客厅-白天，单镜头 3 秒。
+
+detailed_description:
+[Shot 1] 0.00–3.00s，双人中景，主体 @女主
+【动作】@女主 把面霜抬起半寸示意。
+`
+	out := RescalePromptDuration(single, 13)
+	if !strings.Contains(out, "[Shot 1] 0.00–13.00s") {
+		t.Errorf("单镜应缩放到 0.00–13.00s，实际:\n%s", out)
+	}
+	if !strings.Contains(out, "单镜头 13 秒") {
+		t.Errorf("summary 里的秒数没同步，实际:\n%s", out)
+	}
+	if strings.Contains(out, "单镜头 3 秒") {
+		t.Error("summary 里还残留旧的 3 秒")
+	}
+
+	// 多镜按原比例分配：1:2:3 共 6 秒 → 12 秒应是 2:4:6
+	multi := `summary:
+Ref2VA 目标视频：第 1-1 场，客厅，3 个镜头共 6 秒。
+
+detailed_description:
+[Shot 1] 0.00–1.00s，中景
+[Shot 2] 1.00–3.00s，近景
+[Shot 3] 3.00–6.00s，特写
+`
+	got := RescalePromptDuration(multi, 12)
+	for _, want := range []string{
+		"[Shot 1] 0.00–2.00s",
+		"[Shot 2] 2.00–6.00s",
+		"[Shot 3] 6.00–12.00s",
+		"共 12 秒",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("多镜缩放缺少 %q，实际:\n%s", want, got)
+		}
+	}
+
+	// 没有时间轴 / 非法入参：原样返回，不做破坏性改写
+	if in := "没有时间轴的描述词"; RescalePromptDuration(in, 10) != in {
+		t.Error("无时间轴时应原样返回")
+	}
+	if RescalePromptDuration(single, 0) != single {
+		t.Error("total<=0 时应原样返回")
+	}
+
+	// 缩放到比镜头数还短：每段至少 1 秒，不能出现 0 或负区间
+	tiny := RescalePromptDuration(multi, 2)
+	if strings.Contains(tiny, "0.00–0.00s") {
+		t.Errorf("出现了零长度镜头:\n%s", tiny)
+	}
+}
+
+// 硬不变量：分镜卡片显示的时长 == 描述词时间轴的总长。
+//
+// 这两个数曾经由两套算法算出来（一个浮点累加+0.4 后统一 ceil，
+// 一个逐镜 ceil 再相加），于是出现「卡片 4 秒 / 描述词 0.00–3.00s」。
+// 现在两边都走 planShotSeconds，任何偏离这个断言都说明又分叉了。
+func TestDurationMatchesPromptTimeline(t *testing.T) {
+	cases := []struct {
+		name  string
+		draft FrameDraft
+	}{
+		{"单镜短台词", FrameDraft{Shots: []FrameShot{{
+			Action: "说话", Dialogues: []FrameDialogue{{Line: "真的假的？我也试试。"}},
+		}}}},
+		{"单镜长台词", FrameDraft{Shots: []FrameShot{{
+			Action: "说话", Dialogues: []FrameDialogue{{Line: "这个面霜真的好用我用了一个月皮肤白了一个度皮肤也更细腻了"}},
+		}}}},
+		{"三镜纯动作", FrameDraft{Shots: []FrameShot{{Action: "a"}, {Action: "b"}, {Action: "c"}}}},
+		{"两镜按建议秒数", FrameDraft{Shots: []FrameShot{
+			{Seconds: 3, Action: "起幅"}, {Seconds: 5, Action: "推进"},
+		}}},
+		{"台词+动作混合", FrameDraft{Shots: []FrameShot{
+			{Action: "走近", Dialogues: []FrameDialogue{{Line: "你好"}}},
+			{Action: "坐下"},
+		}}},
+		{"无 Shots 走平铺字段", FrameDraft{
+			Action: "她转头看向窗外", Dialogues: []FrameDialogue{{Line: "外面下雨了。"}},
+		}},
+	}
+	for _, c := range cases {
+		dur := EstimateFrameDuration(c.draft)
+		out := BuildFrameVideoPrompt(c.draft, dur)
+		if sum := sumShotSeconds(out); sum != dur {
+			t.Errorf("%s: duration=%d 但描述词时间轴=%d\n%s", c.name, dur, sum, out)
+		}
+	}
+}
+
+// 新格式自带语气括号，EnsureSpeechRate 不能重复插「语气：」行
+func TestEnsureSpeechRateSkipsFieldFormat(t *testing.T) {
+	in := "镜号：1\n景别：双人中景\n台词：@老师（自然，语速平稳）：<d>[Chinese] 坐。</d>\n时长：6s"
+	if got := EnsureSpeechRate(in); got != in {
+		t.Errorf("新格式不该被改动:\n%s", got)
 	}
 }

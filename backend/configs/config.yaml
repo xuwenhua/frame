@@ -6,7 +6,11 @@ app:
   mode: debug # debug / release
   # 生成产物转存目录：上游（RunningHub）的结果 URL 24 小时失效，
   # 任务 SUCCESS 后立即下载到这里，库里存本地 URL
-  result_dir: "/Users/xuwenhua/.jikeai-clone-data/results"
+  #
+  # 用 ~ 表示当前用户主目录，由 config.Load 展开（Windows = C:\Users\<你>，
+  # macOS/Linux = /home/<你>）。这样配置文件跨平台、跨机器都能直接跑，
+  # 不用每换一台机器就手改绝对路径。
+  result_dir: "~/.jikeai-clone-data/results"
   result_url_prefix: "/static/results"
   # 任务并发上限：一个任务一个协程，有多少任务就同时提交多少；
   # 上游并发/排队由网关自己处理（queueTimeoutMs），本地不节流。
@@ -16,11 +20,18 @@ app:
   # 草图要求「纯黑白线条、构图准确」，和出资产图的模型诉求不同，单独指定。
   # 留空则回退到图像分类的默认模型。当前：doubao-seedream-5.0-pro
   sketch_model_id: "384122f1-ef2f-476b-b6f6-4a2ccea94858"
+  # ffmpeg 可执行文件路径：成片合成（把一集的多段分镜按顺序拼成一条）要用。
+  # 留空或写 "ffmpeg" 就走系统 PATH；PATH 里没有时填绝对路径，
+  # 如 "D:/ffmpeg/bin/ffmpeg.exe"。未安装时合成接口会返回明确报错，不影响其他功能。
+  ffmpeg_path: "ffmpeg"
 
 # 数据库配置
 database:
   driver: sqlite # sqlite / postgres / mysql
-  dsn: "/Users/xuwenhua/.jikeai-clone-data/jikeai.db?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000"
+  # 只写文件路径，不带 ?_journal_mode=... 这类驱动私有参数：
+  # WAL / busy_timeout 等 PRAGMA 统一在 database.Init 里执行，
+  # 换驱动（mattn ↔ modernc）时不会因为参数语法不同而静默失效。
+  dsn: "~/.jikeai-clone-data/jikeai.db"
   # postgres 示例:
   # host: localhost
   # port: 5432

@@ -58,6 +58,31 @@ func (r *TaskRepository) ListByStoryboard(userID, storyboardID, taskType string,
 	return list, err
 }
 
+// LatestByAssetIDs 取每个资产最近的一条任务，按 assetID 索引。
+//
+// 用途：首帧分组的列表要显示「生成中 / 失败 / 完成」。
+// 只靠 first_frames.image 是否为空判断不了 —— 任务失败时图永远是空的，
+// 前端会一直以为还在生成（实测要等满 40 次轮询 = 200 秒才停）。
+func (r *TaskRepository) LatestByAssetIDs(taskType, assetType string, ids []string) (map[string]*model.GenerationTask, error) {
+	out := make(map[string]*model.GenerationTask, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var list []model.GenerationTask
+	if err := r.db.
+		Where("type = ? AND asset_type = ? AND asset_id IN ?", taskType, assetType, ids).
+		Order("created_at DESC").Find(&list).Error; err != nil {
+		return out, err
+	}
+	// 已按时间倒序，每个资产第一次出现的就是最新那条
+	for i := range list {
+		if _, ok := out[list[i].AssetID]; !ok {
+			out[list[i].AssetID] = &list[i]
+		}
+	}
+	return out, nil
+}
+
 func (r *TaskRepository) Update(t *model.GenerationTask) error {
 	return r.db.Save(t).Error
 }

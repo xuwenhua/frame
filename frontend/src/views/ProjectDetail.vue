@@ -2,6 +2,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
+import { streamPOST } from '../api/stream'
 import PillSelect from '../components/PillSelect.vue'
 import PillToggle from '../components/PillToggle.vue'
 import CharStylePreview from '../components/CharStylePreview.vue'
@@ -97,14 +98,6 @@ const SCENE_STYLE_OPTIONS = computed<PillOption[]>(() =>
   SCENE_STYLE_BASE.map((o) => ({ ...o, badge: sceneAspect(o.value) }))
 )
 
-/** 当前角色样式 / 场景样式（下拉预览用） */
-const charStyleMeta = computed(
-  () => CHAR_STYLE_OPTIONS.find((o) => o.value === genOpts.value.charStyle) || CHAR_STYLE_OPTIONS[0]
-)
-const sceneStyleMeta = computed(
-  () => SCENE_STYLE_OPTIONS.value.find((o) => o.value === genOpts.value.sceneStyle) || SCENE_STYLE_OPTIONS.value[0]
-)
-
 // ---------- 图像 / 视频模型 ----------
 const imageModels = ref<any[]>([])
 const videoModels = ref<any[]>([])
@@ -162,6 +155,8 @@ const loadModels = async () => {
 // ---------- 分镜 ----------
 const frames = ref<any[]>([])
 const generating = ref(false)
+// 逐段生成的进度（SSE 推过来的）
+const genProgress = ref({ done: 0, total: 0 })
 const activeFrame = ref(0)
 
 /** 画幅与视频模型属于这一集，存 episodes 表；时长按每帧描述词单独算 */
@@ -229,7 +224,22 @@ const missingImages = computed(() => {
 })
 
 /** 资产三段（角色/场景/道具）统一成一张表，模板里少写三份重复结构 */
-const assetSections = computed(() => [
+//
+// type 必须显式声明成联合类型：数组字面量里的 'character' 会被 TS 推断成
+// string，传给 openEdit(type: 'character'|'scene'|'item') 就报 TS2345。
+type AssetType = 'character' | 'scene' | 'item'
+interface AssetSection {
+  key: string
+  type: AssetType
+  thumbCls: string
+  label: string
+  cls: string
+  empty: string
+  desc: string
+  list: any[]
+}
+
+const assetSections = computed<AssetSection[]>(() => [
   { key: 'characters', type: 'character', thumbCls: 'person', label: '角色', cls: 'role', empty: '剧本里没提到明确的人物名', desc: 'imagePrompt', list: assets.value.characters },
   { key: 'scenes', type: 'scene', thumbCls: 'scene', label: '场景', cls: 'scene', empty: '剧本里没标注场景', desc: 'imagePrompt', list: assets.value.scenes },
   { key: 'items', type: 'item', thumbCls: 'item', label: '道具', cls: 'item', empty: '剧本里没识别到关键道具', desc: 'imagePrompt', list: assets.value.items }
@@ -252,6 +262,27 @@ let pollTimer: number | null = null
 const batchRunning = ref(false)
 const generatingVideo = ref(false)
 
+// ---------- 整集合成 ----------
+// 把已出片的分镜按顺序拼成一条完整短剧。后端用 ffmpeg concat + -c copy，
+// 十几段也是秒级，所以走同步接口，点一下转个圈就出结果。
+const composing = ref(false)
+const composed = ref<{ url: string; segments: number; duration: number; skipped: number[] } | null>(null)
+
+const composeEpisode = async () => {
+  if (!episodeId.value || composing.value) return
+  composing.value = true
+  try {
+    const res: any = await api.post(`/episodes/${episodeId.value}/compose`)
+    composed.value = res.data
+    const sec = Math.round(Number(res.data.duration) || 0)
+    toast.success('合成完成', `${res.data.segments} 段 · ${sec} 秒`)
+  } catch (e: any) {
+    toast.error('合成失败', e.response?.data?.message || e.message)
+  } finally {
+    composing.value = false
+  }
+}
+
 const stopPolling = () => {
   if (pollTimer !== null) {
     clearInterval(pollTimer)
@@ -262,11 +293,26 @@ const stopPolling = () => {
 const pollTasks = (onDone?: () => void) => {
   if (!episodeId.value) return
   stopPolling()
+  // 已完成数量：每多完成一段就刷一次分镜
+  // （以前只在"整批全跑完"时刷新 —— 25 段要等几十分钟，
+  //   期间已经出好的视频在列表里看不见，用户只能手动刷新页面）
+  let doneCount = -1
   pollTimer = window.setInterval(async () => {
     try {
       const res: any = await api.get('/tasks', { params: { episodeId: episodeId.value } })
       const { map, pending } = mergeLatestTasks(res.data || [])
       taskMap.value = map
+
+      const nowDone = Object.values(map).filter(
+        (t: any) => t && t.status === 'succeeded'
+      ).length
+      if (doneCount < 0) {
+        doneCount = nowDone // 首次只记基线，不刷
+      } else if (nowDone !== doneCount) {
+        doneCount = nowDone
+        await loadFrames() // 有新的完成 → 把 videoUrl 拉回来
+      }
+
       if (pending === 0) {
         stopPolling()
         batchRunning.value = false
@@ -279,6 +325,23 @@ const pollTasks = (onDone?: () => void) => {
       /* 轮询失败继续下一次 */
     }
   }, 2000)
+}
+
+/**
+ * refreshTasks 拉一次任务列表，并把状态同步到 taskMap。
+ * 刷新页面 / 切换剧集时调用：否则"生成中"标签和自动刷新都不会生效 ——
+ * 用户看到的是图片始终不变，必须手动刷新才能看到新出的视频。
+ */
+const refreshTasks = async () => {
+  if (!episodeId.value) return
+  try {
+    const res: any = await api.get('/tasks', { params: { episodeId: episodeId.value } })
+    const { map, pending } = mergeLatestTasks(res.data || [])
+    taskMap.value = map
+    if (pending > 0) pollTasks() // 还有在跑的，接着轮询到结束
+  } catch {
+    /* 拉不到就算了，不影响主流程 */
+  }
 }
 
 const taskOf = (id: string) => taskMap.value[id]
@@ -329,12 +392,22 @@ const load = async () => {
     const eps: any = await api.get('/episodes', { params: { projectId } })
     episodes.value = eps.data || []
     if (episodes.value.length > 0) {
-      const ep = episodes.value[0]
+      // 必须按 URL 上的 episodeId 加载：项目工作台点某一集的「创作」进来时
+      // 会带 ?episodeId=xxx，之前这里永远取 episodes[0]，
+      // 于是从第 2 集点进来、页面打开的却是第 1 集 ——
+      // 用户以为在第 2 集，粘贴的剧本和识别出的资产全写进了第 1 集（实测踩过）。
+      const wantId = String(route.query.episodeId || '')
+      const ep = episodes.value.find((e: any) => e.id === wantId) || episodes.value[0]
       episodeId.value = ep.id
       curEpisode.value = ep
       script.value = ep.scriptText || ''
+      // 换了剧集，上一集的成片不能再显示（否则会挂着别人的片子）
+      composed.value = null
       applyEpisodeConfig(ep)
       await Promise.all([loadAssets(), loadFrames(), loadFirstFrameGroups()])
+      // 拉一次任务状态：有任务在跑就自动接上轮询，
+      // 不用等用户手动刷新才知道视频好了
+      await refreshTasks()
 
       if (frames.value.length > 0) step.value = 2
       else if (assets.value.characters.length > 0) step.value = 1
@@ -360,7 +433,10 @@ const ensureEpisode = async (): Promise<string> => {
   })
   episodeId.value = res.data.id
   curEpisode.value = res.data
-  episodes.value = [res.data]
+  // 追加而不是覆盖：覆盖会让下拉里只剩这一集，切不回别的集
+  if (!episodes.value.some((e: any) => e.id === res.data.id)) {
+    episodes.value = [...episodes.value, res.data]
+  }
   return episodeId.value
 }
 
@@ -413,27 +489,44 @@ const generateStoryboard = async () => {
     if (!ok) return
   }
   generating.value = true
+  genProgress.value = { done: 0, total: 0 }
+  let warnMsg = ''
   try {
-    const res: any = await api.post('/storyboard/generate', {
-      episodeId: episodeId.value,
-      duration: sbSeconds.value
-    })
-    frames.value = res.data?.frames || []
+    // 逐段生成：后端先出大纲，再一段段推过来。
+    // 前端只负责显示进度 —— 全部完成后统一落库，中途失败不会清掉旧分镜。
+    await streamPOST<any>(
+      '/storyboard/generate/stream',
+      { episodeId: episodeId.value, duration: sbSeconds.value },
+      (ev) => {
+        if (ev.type === 'outline') {
+          genProgress.value = { done: 0, total: ev.count || 0 }
+        } else if (ev.type === 'frame') {
+          genProgress.value = {
+            done: ev.index || genProgress.value.done + 1,
+            total: ev.total || genProgress.value.total
+          }
+        } else if (ev.type === 'error') {
+          warnMsg = ev.message || warnMsg
+        } else if (ev.type === 'done') {
+          if (ev.message) warnMsg = ev.message
+        }
+      }
+    )
+    await loadFrames()
     activeFrame.value = 0
     step.value = 2
-    const engine = res.data?.engine
     const n = frames.value.length
-    if (engine === 'llm') {
-      toast.success(`生成 ${n} 段分镜`, res.data?.model ? `模型：${res.data.model}` : undefined)
+    if (warnMsg) {
+      toast.warning(`生成 ${n} 段分镜`, warnMsg)
     } else {
-      // 降级必须显式提示：否则用户看到的是「抠句子」的结果，以为模型不行
-      toast.warning(`生成 ${n} 段分镜（规则引擎兜底）`, res.data?.warning || '文本模型不可用，内容质量会明显下降')
+      toast.success(`生成 ${n} 段分镜`)
     }
     await loadFirstFrameGroups()
   } catch (e: any) {
-    toast.error('生成失败', e.response?.data?.message || e.message)
+    toast.error('生成失败', e.message)
   } finally {
     generating.value = false
+    genProgress.value = { done: 0, total: 0 }
   }
 }
 
@@ -500,6 +593,61 @@ const regenAssetImage = async (assetType: string, assetId: string) => {
   }
 }
 
+// ---------- 场景全景：柱形全景图 → 360 视频 ----------
+// 单张场景图只有正前方，过肩/反打镜头全靠模型编，环境和家具就会变；
+// 全景图是让模型看清「房间其余角度长什么样」。
+const panoramaBusy = ref<Record<string, boolean>>({})
+const panoramaVideoBusy = ref<Record<string, boolean>>({})
+
+/** 图片编辑模型：优先 qwen-image-2.1-pe（图生图），没有就退默认图片模型 */
+const editModelId = () => {
+  const m =
+    imageModels.value.find((x: any) => String(x.workflow || '').includes('qwen-image-2.1-pe')) ||
+    imageModels.value.find((x: any) => x.isDefault && x.hasKey !== false) ||
+    imageModels.value.find((x: any) => x.hasKey !== false)
+  return m?.id || ''
+}
+
+/** 全景视频工作流：model_id = panorama-to-360video 的那条配置 */
+const panoramaVideoModelId = () =>
+  videoModels.value.find((x: any) => x.workflow === 'panorama-to-360video')?.id || ''
+
+const makePanorama = async (a: any) => {
+  if (panoramaBusy.value[a.id]) return
+  if (!a.referenceImage) return toast.warning('先生成场景图', '全景图是在场景图基础上往外扩展的')
+  const modelId = editModelId()
+  if (!modelId) return toast.warning('没有可用的图片编辑模型', '请到管理端添加图生图模型')
+  panoramaBusy.value[a.id] = true
+  taskMap.value[a.id] = { status: 'pending', progress: 0 }
+  try {
+    await api.post('/generate/panorama', { sceneId: a.id, modelId })
+    pollTasks(() => toast.success('柱形全景图已生成'))
+  } catch (e: any) {
+    delete taskMap.value[a.id]
+    toast.error('生成全景图失败', e.response?.data?.message || e.message)
+  } finally {
+    panoramaBusy.value[a.id] = false
+  }
+}
+
+const makePanoramaVideo = async (a: any) => {
+  if (panoramaVideoBusy.value[a.id]) return
+  if (!a.panoramaImage) return toast.warning('先生成柱形全景图')
+  const modelId = panoramaVideoModelId()
+  if (!modelId) return toast.warning('没有配置全景视频工作流', '请在管理端添加 panorama-to-360video')
+  panoramaVideoBusy.value[a.id] = true
+  taskMap.value[a.id] = { status: 'pending', progress: 0 }
+  try {
+    await api.post('/generate/panorama-video', { sceneId: a.id, modelId })
+    pollTasks(() => toast.success('360 全景视频已生成'))
+  } catch (e: any) {
+    delete taskMap.value[a.id]
+    toast.error('生成全景视频失败', e.response?.data?.message || e.message)
+  } finally {
+    panoramaVideoBusy.value[a.id] = false
+  }
+}
+
 // ---------- 资产：编辑 / 删除 / 大图 ----------
 const editOpen = ref(false)
 const editType = ref<'character' | 'scene' | 'item'>('character')
@@ -510,6 +658,16 @@ const viewerSrc = ref('')
 
 const viewImage = (src?: string) => {
   if (src) viewerSrc.value = src
+}
+
+/** 场景卡内嵌视频：悬停播放 / 移出暂停（避免同时播放多个视频占资源） */
+const playInline = (e: MouseEvent) => {
+  const v = e.target as HTMLVideoElement
+  v?.play?.().catch(() => {})
+}
+const pauseInline = (e: MouseEvent) => {
+  const v = e.target as HTMLVideoElement
+  v?.pause?.()
 }
 
 const openEdit = (type: 'character' | 'scene' | 'item', a: any) => {
@@ -716,8 +874,9 @@ const openFirstFramePanel = async () => {
 /** 这次正在生成哪几组（用来给缩略图加遮罩，而不是整块都在转圈） */
 const ffBusyIds = ref<string[]>([])
 
-/** 某一组是不是正在生成 */
-const isFfBusy = (g: any) => ffGenBusy.value && !!g && ffBusyIds.value.includes(g.id)
+/** 某一组是不是正在生成（已失败的不再算「生成中」，否则界面会一直转圈） */
+const isFfBusy = (g: any) =>
+  ffGenBusy.value && !!g && ffBusyIds.value.includes(g.id) && g.taskStatus !== 'failed'
 
 const genFirstFrameGroups = async () => {
   if (!episodeId.value || ffGenBusy.value) return
@@ -740,16 +899,28 @@ const genFirstFrameGroups = async () => {
       } catch { /* 轮询失败不打断 */ }
       const done = ffGroups.value.filter((g: any) => {
         if (!ffBusyIds.value.includes(g.id)) return true
+        // 任务失败也算结束：只等「图变了」的话，失败时图永远不变，
+        // 会一直转到 40 次轮询超时（200 秒），用户以为卡死了
+        if (g.taskStatus === 'failed') return true
         const prev = before.get(g.id) || ''
         return !!g.image && g.image !== prev
       }).length
       if (done >= ffGroups.value.length || tries >= 40) {
         window.clearInterval(timer)
+        // 先取失败清单，下面会把 ffBusyIds 清空
+        const failed = ffGroups.value.filter(
+          (g: any) => ffBusyIds.value.includes(g.id) && g.taskStatus === 'failed'
+        )
         ffGenBusy.value = false
         ffBusyIds.value = []
         const finished = ffGroups.value.filter((g: any) => !!g.image).length
-        if (finished > 0) toast.success(`首帧图完成 ${finished}/${ffGroups.value.length}`)
-        else toast.warning('首帧图还在生成，稍后刷新查看')
+        if (failed.length > 0) {
+          toast.error(`首帧图失败 ${failed.length} 组`, failed[0].taskError || '上游报错，可重试')
+        } else if (finished > 0) {
+          toast.success(`首帧图完成 ${finished}/${ffGroups.value.length}`)
+        } else {
+          toast.warning('首帧图还在生成，稍后刷新查看')
+        }
       }
     }, 5000)
   } catch (e: any) {
@@ -912,12 +1083,17 @@ const parseFrameShots = (vp: string) => {
     return shots
   }
 
-  // ---------- 老格式（｜镜头N｜ 0–2秒｜中景｜固定机位｜） ----------
+  // ---------- 镜头表（｜镜头N｜ 0–2秒｜中景｜固定机位｜） ----------
+  // 分隔符兼容全角 ｜ 和半角 |：新格式（参考站风格）输出的是半角
+  // 「|镜头1| 0-6秒| 双人中景| 固定机位|」，老数据是全角
   let old: any = null
   const bodies: string[][] = []
   for (const raw of text.split('\n')) {
     const line = raw.trim()
-    const m = line.match(/^｜镜头\s*(\d+)｜\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*秒｜\s*([^｜]*)(?:｜\s*([^｜]*))?/)
+    // 【执行要点】是全局规则，不属于任何镜头：
+    // 它的正文不以【开头，会被误当成最后一个镜头的动作
+    if (line.startsWith('【执行要点】')) break
+    const m = line.match(/^[｜|]镜头\s*(\d+)[｜|]\s*([\d.]+)\s*[–—\-~～至]\s*([\d.]+)\s*秒[｜|]\s*([^｜|]*)(?:[｜|]\s*([^｜|]*))?/)
     if (m) {
       if (old) shots.push(old)
       old = {
@@ -943,7 +1119,20 @@ const parseFrameShots = (vp: string) => {
     const body = (bodies[i] || []).join('\n')
     // 台词用贪婪 (.*) 取到行末最后一个 ”：台词内部可能还有引号
     const dl = body.split('\n').map((x) => x.trim()).find((x) => x.includes('台词】'))
-    const line = dl ? (/：“(.*)”/.exec(dl)?.[1] || '').trim() : ''
+    // 台词正文可能在引号里，也可能被 <d>[Chinese] …</d> 包着，统一剥掉
+    let line = ''
+    if (dl) {
+      // 取「台词】」之后第一个冒号后的内容：正文里本身可能有冒号
+      // （「三个问题：…」），用 lastIndexOf 会被正文里的冒号截断
+      const base = dl.indexOf('台词】')
+      const ci = dl.indexOf('：', base + 3)
+      line = (ci > 0 ? dl.slice(ci + 1) : '')
+        .replace(/^[“"]/, '')
+        .replace(/[”"]$/, '')
+        .replace(/<\/?d>/g, '')
+        .replace(/\[[A-Za-z]+\]/g, '')
+        .trim()
+    }
     let action = ''
     const ai = body.indexOf('【动作】')
     if (ai >= 0) {
@@ -955,7 +1144,11 @@ const parseFrameShots = (vp: string) => {
         }
       }
     } else {
-      action = body.split('\n').map((x) => x.trim()).find((x) => x && !x.startsWith('【') && !x.startsWith('｜')) || ''
+      action =
+        body
+          .split('\n')
+          .map((x) => x.trim())
+          .find((x) => x && !x.startsWith('【') && !x.startsWith('｜') && !x.startsWith('|')) || ''
     }
     const chars = (line.match(/[\u4e00-\u9fa5A-Za-z0-9]/g) || []).length
     const pauses = (line.match(/——|—{2,}|-{2,}/g) || []).length
@@ -991,7 +1184,6 @@ const gotoFrame = (frameNo: number) => {
 
 // ---------- 其它 ----------
 const frameShots = computed(() => parseFrameShots(activeFrameData.value?.videoPrompt || ''))
-const frameStatus = (f: any) => taskOf(f.id)?.status || ''
 const back = () => router.push('/projects')
 
 /**
@@ -1008,15 +1200,45 @@ const switchEpisode = async () => {
   curEpisode.value = ep
   script.value = ep.scriptText || ''
   applyEpisodeConfig(ep)
+  // 集号同步进 URL：刷新、前进后退都停在这一集，复制链接给别人也打开同一集
+  router.replace({ path: route.path, query: { ...route.query, episodeId: episodeId.value } })
   activeFrame.value = 0
   ffGroups.value = []
+  // 换集先停掉上一集的轮询，避免把别的集的任务状态混过来
+  stopPolling()
+  taskMap.value = {}
   await Promise.all([loadAssets(), loadFrames(), loadFirstFrameGroups()])
+  await refreshTasks()
   step.value = frames.value.length > 0 ? 2 : assets.value.characters.length > 0 ? 1 : 0
 }
 
 /** 大图查看时按 Esc 关闭 */
 const onKeydown = (e: KeyboardEvent) => {
   if (e.key === 'Escape') viewerSrc.value = ''
+}
+
+/**
+ * v-autosize：textarea 高度跟随内容自动增长。
+ *
+ * 首帧规划的描述经常有 5-8 行（28 段的全景描述），固定 3 行高要来回滚动
+ * 才能看全，改起来也容易漏行。用 max-height 兜底，超长才出滚动条。
+ */
+const vAutosize = {
+  mounted(el: any) {
+    const fit = () => {
+      el.style.height = 'auto'
+      el.style.height = `${el.scrollHeight}px`
+    }
+    el.__fit = fit
+    el.addEventListener('input', fit)
+    fit()
+  },
+  updated(el: any) {
+    el.__fit?.()
+  },
+  unmounted(el: any) {
+    if (el.__fit) el.removeEventListener('input', el.__fit)
+  },
 }
 
 onMounted(async () => {
@@ -1207,7 +1429,7 @@ onUnmounted(() => {
             </button>
             <button class="btn btn-primary btn-sm" :disabled="generating" @click="generateStoryboard">
               <span v-if="generating" class="spinner"></span>
-              {{ generating ? '生成中' : '下一步：生成分镜' }}
+              {{ generating ? (genProgress.total ? `生成中 ${genProgress.done}/${genProgress.total}` : '生成中…') : '下一步：生成分镜' }}
             </button>
           </div>
         </div>
@@ -1221,49 +1443,164 @@ onUnmounted(() => {
               <span class="sec-ratio">{{ ratioOf(sec.type) }}</span>
             </div>
 
-            <div v-if="sec.list.length" class="asset-grid">
-              <div v-for="a in sec.list" :key="a.id" class="asset-card">
-                <div class="asset-thumb" :class="sec.thumbCls">
-                  <img
-                    v-if="a.referenceImage"
-                    :src="a.referenceImage"
-                    :alt="a.name"
-                    @click="viewImage(a.referenceImage)"
-                  />
-                  <template v-else>{{ a.name?.[0] }}</template>
-                  <span v-if="sec.type === 'character' && genOpts.showName" class="thumb-name">{{ a.name }}</span>
-                  <div v-if="isTaskRunning(taskOf(a.id))" class="thumb-mask">
-                    <span class="spinner"></span>
+            <div v-if="sec.list.length" class="asset-grid" :class="{ 'scene-grid': sec.type === 'scene' }">
+              <div v-for="a in sec.list" :key="a.id" class="asset-card" :class="{ 'scene-card': sec.type === 'scene' }">
+                <!-- 场景卡：左=原场景图卡片，右=柱形全景图 / 360视频 上下两格 -->
+                <template v-if="sec.type === 'scene'">
+                  <div class="scene-main">
+                    <div class="asset-thumb" :class="sec.thumbCls">
+                      <img
+                        v-if="a.referenceImage"
+                        :src="a.referenceImage"
+                        :alt="a.name"
+                        @click="viewImage(a.referenceImage)"
+                      />
+                      <template v-else>{{ a.name?.[0] }}</template>
+                      <div v-if="isTaskRunning(taskOf(a.id))" class="thumb-mask">
+                        <span class="spinner"></span>
+                      </div>
+                    </div>
+                    <div class="asset-body">
+                      <div class="ab-head">
+                        <h4>
+                          <span class="an">{{ a.name }}</span>
+                          <span v-if="a.timeOfDay || a.category" class="tod">{{ a.timeOfDay || a.category }}</span>
+                        </h4>
+                      </div>
+                      <p class="asset-prompt">{{ a[sec.desc] || a.identityAnchor || a.spatialAnchor || a.prompt }}</p>
+                      <div class="ab-acts">
+                        <button class="regen-main" @click="regenAssetImage(sec.type, a.id)">
+                          <svg viewBox="0 0 24 24" fill="none" width="11" height="11">
+                            <path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                            <path d="M18 3v4h-4M6 21v-4h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                          </svg>
+                          重新生成
+                        </button>
+                        <button class="icon-btn" title="编辑" @click="openEdit(sec.type, a)">
+                          <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                            <path d="M4 20h4l10-10-4-4L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+                          </svg>
+                        </button>
+                        <button class="icon-btn danger" title="删除" @click="removeAsset(sec.type, a)">
+                          <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                            <path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div class="asset-body">
-                  <div class="ab-head">
-                    <h4>
-                      <span class="an">{{ a.name }}</span>
-                      <span v-if="a.timeOfDay || a.category" class="tod">{{ a.timeOfDay || a.category }}</span>
-                    </h4>
+
+                  <div class="scene-side">
+                    <!-- 柱形全景图 -->
+                    <div class="scene-panel">
+                      <div class="panel-head">
+                        <span class="panel-label">柱形全景图</span>
+                        <button
+                          class="icon-btn"
+                          :disabled="panoramaBusy[a.id]"
+                          :title="a.panoramaImage ? '重做柱形全景图（不覆盖场景图）' : '把场景图扩展成 360 度柱形全景图'"
+                          @click="makePanorama(a)"
+                        >
+                          <span v-if="panoramaBusy[a.id]" class="spinner"></span>
+                          <svg v-else viewBox="0 0 24 24" fill="none" width="12" height="12">
+                            <path d="M3 12a9 9 0 0 1 18 0 9 9 0 0 1-18 0Z" stroke="currentColor" stroke-width="1.7" />
+                            <path d="M3 12c3 3 15 3 18 0M12 3c-3 3-3 15 0 18" stroke="currentColor" stroke-width="1.5" />
+                          </svg>
+                        </button>
+                      </div>
+                      <div v-if="a.panoramaImage" class="panel-media">
+                        <img :src="a.panoramaImage" alt="柱形全景图" @click="viewImage(a.panoramaImage)" />
+                      </div>
+                      <div v-else class="panel-empty">
+                        <template v-if="panoramaBusy[a.id]"><span class="spinner"></span>生成中…</template>
+                        <template v-else>点击右上角生成<br />柱形全景图</template>
+                      </div>
+                    </div>
+
+                    <!-- 360 全景视频 -->
+                    <div class="scene-panel">
+                      <div class="panel-head">
+                        <span class="panel-label">360 全景视频</span>
+                        <button
+                          class="icon-btn"
+                          :disabled="panoramaVideoBusy[a.id] || !a.panoramaImage"
+                          :title="a.panoramaVideo ? '重做 360 全景视频' : '把柱形全景图转成 360 全景视频'"
+                          @click="makePanoramaVideo(a)"
+                        >
+                          <span v-if="panoramaVideoBusy[a.id]" class="spinner"></span>
+                          <svg v-else viewBox="0 0 24 24" fill="none" width="12" height="12">
+                            <path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                            <path d="M18 3v4h-4M6 21v-4h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                          </svg>
+                        </button>
+                      </div>
+                      <div v-if="a.panoramaVideo" class="panel-media video">
+                        <video
+                          :src="a.panoramaVideo"
+                          :poster="a.panoramaImage || undefined"
+                          muted
+                          loop
+                          playsinline
+                          preload="metadata"
+                          @mouseenter="playInline"
+                          @mouseleave="pauseInline"
+                        ></video>
+                        <span class="pano-play" title="点击查看" @click="viewImage(a.panoramaVideo)">▶</span>
+                      </div>
+                      <div v-else class="panel-empty">
+                        <template v-if="panoramaVideoBusy[a.id]"><span class="spinner"></span>生成中…</template>
+                        <template v-else-if="!a.panoramaImage">需先生成柱形全景图</template>
+                        <template v-else>点击右上角生成<br />360 全景视频</template>
+                      </div>
+                    </div>
                   </div>
-                  <p class="asset-prompt">{{ a[sec.desc] || a.identityAnchor || a.spatialAnchor || a.prompt }}</p>
-                  <div class="ab-acts">
-                    <button class="regen-main" @click="regenAssetImage(sec.type, a.id)">
-                      <svg viewBox="0 0 24 24" fill="none" width="11" height="11">
-                        <path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-                        <path d="M18 3v4h-4M6 21v-4h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                      重新生成
-                    </button>
-                    <button class="icon-btn" title="编辑" @click="openEdit(sec.type, a)">
-                      <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
-                        <path d="M4 20h4l10-10-4-4L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
-                      </svg>
-                    </button>
-                    <button class="icon-btn danger" title="删除" @click="removeAsset(sec.type, a)">
-                      <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
-                        <path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                    </button>
+                </template>
+
+                <!-- 角色 / 道具：保持原有卡片结构 -->
+                <template v-else>
+                  <div class="asset-thumb" :class="sec.thumbCls">
+                    <img
+                      v-if="a.referenceImage"
+                      :src="a.referenceImage"
+                      :alt="a.name"
+                      @click="viewImage(a.referenceImage)"
+                    />
+                    <template v-else>{{ a.name?.[0] }}</template>
+                    <span v-if="sec.type === 'character' && genOpts.showName" class="thumb-name">{{ a.name }}</span>
+                    <div v-if="isTaskRunning(taskOf(a.id))" class="thumb-mask">
+                      <span class="spinner"></span>
+                    </div>
                   </div>
-                </div>
+                  <div class="asset-body">
+                    <div class="ab-head">
+                      <h4>
+                        <span class="an">{{ a.name }}</span>
+                        <span v-if="a.timeOfDay || a.category" class="tod">{{ a.timeOfDay || a.category }}</span>
+                      </h4>
+                    </div>
+                    <p class="asset-prompt">{{ a[sec.desc] || a.identityAnchor || a.spatialAnchor || a.prompt }}</p>
+                    <div class="ab-acts">
+
+                      <button class="regen-main" @click="regenAssetImage(sec.type, a.id)">
+                        <svg viewBox="0 0 24 24" fill="none" width="11" height="11">
+                          <path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+                          <path d="M18 3v4h-4M6 21v-4h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                        重新生成
+                      </button>
+                      <button class="icon-btn" title="编辑" @click="openEdit(sec.type, a)">
+                        <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                          <path d="M4 20h4l10-10-4-4L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+                        </svg>
+                      </button>
+                      <button class="icon-btn danger" title="删除" @click="removeAsset(sec.type, a)">
+                        <svg viewBox="0 0 24 24" fill="none" width="13" height="13">
+                          <path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </template>
               </div>
             </div>
             <div v-else class="asset-empty">{{ sec.empty }}</div>
@@ -1312,7 +1649,7 @@ onUnmounted(() => {
               {{ ffGenBusy ? '首帧生成中…' : `首帧图（${ffGroups.filter((g: any) => g.image).length}/${ffGroups.length}）` }}
             </button>
             <button class="sb-btn" :disabled="generating" @click="generateStoryboard">
-              {{ generating ? '生成中…' : '重新生成' }}
+              {{ generating ? (genProgress.total ? `生成中 ${genProgress.done}/${genProgress.total}` : '生成中…') : '重新生成' }}
             </button>
             <button
               class="sb-btn primary"
@@ -1522,10 +1859,16 @@ onUnmounted(() => {
               <h2>生成成片</h2>
               <p>{{ frames.length }} 段，共 {{ totalDuration }} 秒 · 每段按自己的时长单独生成</p>
             </div>
-            <button class="btn btn-primary btn-sm" :disabled="generatingVideo || !pendingVideoCount" @click="generateVideos">
-              <span v-if="generatingVideo" class="spinner"></span>
-              {{ generatingVideo ? '提交中…' : pendingVideoCount ? `生成剩余 ${pendingVideoCount} 段` : '已全部出片' }}
-            </button>
+            <div class="ph-actions">
+              <button class="btn btn-ghost btn-sm" :disabled="composing || !doneVideoCount" @click="composeEpisode">
+                <span v-if="composing" class="spinner"></span>
+                {{ composing ? '合成中…' : '合成整集' }}
+              </button>
+              <button class="btn btn-primary btn-sm" :disabled="generatingVideo || !pendingVideoCount" @click="generateVideos">
+                <span v-if="generatingVideo" class="spinner"></span>
+                {{ generatingVideo ? '提交中…' : pendingVideoCount ? `生成剩余 ${pendingVideoCount} 段` : '已全部出片' }}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1547,6 +1890,19 @@ onUnmounted(() => {
               <span class="vs-label">画幅</span>
               <span class="vs-value">{{ sbRatio }}</span>
             </div>
+          </div>
+
+          <!-- 整集合成结果：按分镜顺序拼成的一条完整短剧 -->
+          <div v-if="composed" class="composed">
+            <div class="composed-head">
+              <span class="composed-badge">成片</span>
+              <span class="composed-meta">{{ composed.segments }} 段 · {{ Math.round(Number(composed.duration) || 0) }} 秒</span>
+              <span v-if="composed.skipped && composed.skipped.length" class="composed-warn">
+                跳过第 {{ composed.skipped.join('、') }} 段（未出片）
+              </span>
+              <a class="composed-dl" :href="composed.url" download>下载</a>
+            </div>
+            <video :src="composed.url" controls playsinline preload="metadata"></video>
           </div>
 
           <div class="vlist">
@@ -1667,13 +2023,18 @@ onUnmounted(() => {
                   <span class="spinner"></span>
                   <span class="ffg-mask-t">生成中</span>
                 </div>
+                <!-- 失败要有明确落点：不然用户只看到「未生成」，不知道是没点还是跑挂了 -->
+                <div v-else-if="g.taskStatus === 'failed' && !g.image" class="ffg-mask fail" :title="g.taskError">
+                  <span class="ffg-mask-t">生成失败</span>
+                  <span class="ffg-mask-e">{{ g.taskError || '上游报错' }}</span>
+                </div>
               </div>
               <div class="ffg-body">
                 <div class="ffg-title">
                   第 {{ i + 1 }} 组 · {{ g.sceneName || '未命名场景' }}
                   <span class="ffg-count">{{ parseIdx(g.frameIndexes).length }} 段</span>
                 </div>
-                <textarea v-model="g.description" class="ffg-desc" rows="3"></textarea>
+                <textarea v-model="g.description" v-autosize class="ffg-desc" rows="3"></textarea>
                 <div class="ffg-foot">
                   <span class="ffg-frames">覆盖：{{ parseIdx(g.frameIndexes).join('、') }}</span>
                   <button class="link-btn" @click="saveGroupDesc(g)">保存描述</button>
@@ -2030,6 +2391,7 @@ onUnmounted(() => {
 .asset-card:hover { border-color: var(--border-strong); background: var(--surface-hover); transform: translateY(-2px); }
 
 .asset-thumb {
+  position: relative;
   position: relative;
   width: 100%;
   aspect-ratio: 4 / 3;
@@ -2515,6 +2877,47 @@ onUnmounted(() => {
 .wb-empty { flex: 1; display: grid; place-items: center; color: var(--text-mute); font-size: 12.5px; }
 
 /* 成片 */
+.ph-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+/* 整集合成的成片卡片：黑底播放器 + 一条信息栏 */
+.composed {
+  margin-bottom: 18px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-strong);
+  background: #000;
+  overflow: hidden;
+}
+.composed-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+}
+.composed-badge {
+  font-size: 11px;
+  font-weight: 570;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 2px 8px;
+  border-radius: 5px;
+}
+.composed-meta { font-size: 12px; color: var(--text-dim); }
+.composed-warn { font-size: 12px; color: var(--warn); }
+.composed-dl {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  padding: 3px 10px;
+  border-radius: 6px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.composed-dl:hover { color: var(--text); border-color: var(--border-strong); }
+.composed video { display: block; width: 100%; max-height: 520px; background: #000; }
+
 .video-body { padding: 20px 24px; }
 .vsummary {
   display: flex;
@@ -2629,6 +3032,19 @@ onUnmounted(() => {
   color: var(--text-dim);
 }
 .ffg-mask .spinner { width: 16px; height: 16px; }
+/* 失败态：红字 + 截断的错误原因，鼠标悬停看完整内容 */
+.ffg-mask.fail { background: rgba(40, 12, 12, 0.78); color: var(--err); }
+.ffg-mask.fail .ffg-mask-t { font-weight: 570; }
+.ffg-mask-e {
+  max-width: 96px;
+  font-size: 9.5px;
+  line-height: 1.4;
+  color: var(--text-mute);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
 .ff-busy-dot {
   display: inline-block;
   width: 6px;
@@ -2655,7 +3071,12 @@ onUnmounted(() => {
   font-size: 11.5px;
   line-height: 1.6;
   color: var(--text-dim);
-  resize: vertical;
+  /* 高度由 v-autosize 按内容算；手动拖拽会和自动增高打架，关掉 */
+  resize: none;
+  /* 兜底：描述再长也不让弹窗被撑爆，超出才出滚动条 */
+  min-height: 64px;
+  max-height: 320px;
+  overflow-y: auto;
 }
 .ffg-foot { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .ffg-frames { flex: 1; font-size: 11px; color: var(--text-mute); }
@@ -2711,4 +3132,111 @@ onUnmounted(() => {
   .asset-wrap { padding: 16px 16px 4px; }
   .vsummary { flex-wrap: wrap; gap: 18px; }
 }
+/* ===== 场景卡：左=原场景图，右=柱形全景图 / 360视频 上下排列 ===== */
+.scene-grid { grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); }
+.scene-card {
+  flex-direction: row;
+  align-items: stretch;
+  gap: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.012);
+}
+.scene-main {
+  display: flex;
+  flex-direction: column;
+  width: 190px;
+  flex: none;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.018);
+  overflow: hidden;
+}
+.scene-side {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 8px;
+}
+.scene-panel {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-md);
+  border: 1px dashed var(--border);
+  background: rgba(255, 255, 255, 0.015);
+  overflow: hidden;
+  min-height: 0;
+}
+.scene-panel .panel-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.panel-label {
+  flex: 1;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  letter-spacing: 0.3px;
+}
+.panel-media {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: rgba(0, 0, 0, 0.25);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.panel-media img,
+.panel-media video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.panel-media img { cursor: zoom-in; }
+.panel-media.video video { cursor: pointer; }
+.pano-play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  color: #fff;
+  font-size: 11px;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+}
+.panel-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--text-mute);
+}
+/* 窄屏：场景卡回退为竖排，三块纵向堆叠 */
+@media (max-width: 720px) {
+  .scene-card { flex-direction: column; }
+  .scene-main { width: 100%; }
+  .scene-side { grid-template-rows: auto auto; }
+  .scene-panel { min-height: 120px; }
+}
+@supports not (aspect-ratio: 1) {
+  .scene-main .asset-thumb { padding-top: 75%; }
+}
+
 </style>

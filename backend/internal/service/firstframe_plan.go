@@ -44,12 +44,39 @@ const firstFramePlanSystemPrompt = `你是影视制片。下面是一集的分�
 只输出 JSON，不要解释、不要 markdown 代码块：
 {"groups":[{"scene":"场景名","description":"全景空间描述","frames":[1,2,3]}]}`
 
+// PlanAsset 首帧规划时一起发给模型的资产参考图
+type PlanAsset struct {
+	Name    string // 老师 / 教师办公室-白天
+	Kind    string // character / scene
+	DataURL string // data:image/jpeg;base64,...（InlineImage 产出）
+}
+
+// planVisionHint 附在系统提示词后面：这一轮模型能看到资产图
+const planVisionHint = `
+
+【这一轮会附上资产参考图】
+先看图再写描述。图是事实，文字只是参考：
+1. 场景图里的家具布局是基准 —— 桌子在房间中间还是靠墙、椅子有几把、窗户在哪一侧，
+   描述都按图写。分镜文字里没提到的家具，不要凭空加。
+2. 人物图决定长相和服装，描述里**只写位置和朝向**（谁在哪一侧、坐着还是站着、
+   身体朝谁），不要再复述外貌 —— 复述错了反而让出图模型纠结。
+3. 分镜文字和图对不上时（比如文字写「坐在桌前」但图里桌前没有椅子），
+   按图的空间结构安排人物，把动作改成可行的版本。`
+
 // PlanFirstFrames 让 LLM 把一集的分镜归并成若干首帧图分组。
 //
 // 为什么要归并：16 段每段单独合成一张首帧图，模型每次对这个房间的理解都不同，
 // 空间越画越漂；而按「场景 + 机位」归并后，同机位的所有段共用一张图，
 // 空间和人物位置就锁死了，图的数量也从「段数」降到「机位数」。
-func PlanFirstFrames(ctx context.Context, client *aiclient.LLMClient, frames []model.Storyboard) ([]FirstFrameGroup, error) {
+//
+// assets 是这一集的角色图与场景图（已转成 data URL）。
+// 传了图，描述才会贴合真实的空间布局；不传也能跑，但描述是「凭空想象」的。
+func PlanFirstFrames(
+	ctx context.Context,
+	client *aiclient.LLMClient,
+	frames []model.Storyboard,
+	assets []PlanAsset,
+) ([]FirstFrameGroup, error) {
 	if client == nil {
 		return nil, fmt.Errorf("没有可用的文本模型")
 	}
@@ -83,9 +110,30 @@ func PlanFirstFrames(ctx context.Context, client *aiclient.LLMClient, frames []m
 			f.FrameIndex, scene, fallbackText(sit, "（未写）"), fallbackText(strings.Join(people, "、"), "（未写）"))
 	}
 
+	sysPrompt := firstFramePlanSystemPrompt
+	userParts := make([]aiclient.ContentPart, 0, len(assets)*2+2)
+	userParts = append(userParts, aiclient.TextPart(b.String()))
+
+	if len(assets) > 0 {
+		sysPrompt += planVisionHint
+		userParts = append(userParts, aiclient.TextPart("\n【资产参考图】先看图，再按图写描述："))
+		for _, a := range assets {
+			if strings.TrimSpace(a.DataURL) == "" {
+				continue
+			}
+			kind := "人物"
+			if a.Kind == "scene" {
+				kind = "场景"
+			}
+			// 图前先标明这张是谁，否则模型对着一串图分不清哪张是场景
+			userParts = append(userParts, aiclient.TextPart(fmt.Sprintf("「%s」（%s）：", a.Name, kind)))
+			userParts = append(userParts, aiclient.ImagePart(a.DataURL))
+		}
+	}
+
 	res, err := client.Chat(ctx, []aiclient.ChatMessage{
-		{Role: "system", Content: firstFramePlanSystemPrompt},
-		{Role: "user", Content: b.String()},
+		{Role: "system", Content: sysPrompt},
+		{Role: "user", Content: userParts},
 	}, 0.3, 8000)
 	if err != nil {
 		return nil, fmt.Errorf("首帧规划失败: %w", err)

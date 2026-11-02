@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,6 +38,10 @@ type FirstFrameHandler struct {
 	pointsRepo  *repository.PointsRepository
 	settingRepo *repository.SettingRepository
 	queue       *queue.Queue
+	// resultDir / ffmpegPath：首帧规划要把资产图压缩后喂给视觉模型，
+	// 需要把 /static/results/xxx 映射到磁盘并调用 ffmpeg 缩图
+	resultDir  string
+	ffmpegPath string
 }
 
 func NewFirstFrameHandler(
@@ -51,13 +57,14 @@ func NewFirstFrameHandler(
 	pointsRepo *repository.PointsRepository,
 	settingRepo *repository.SettingRepository,
 	q *queue.Queue,
+	resultDir, ffmpegPath string,
 ) *FirstFrameHandler {
 	return &FirstFrameHandler{
 		provider: provider, ffRepo: ffRepo, boardRepo: boardRepo,
 		episodeRepo: episodeRepo, projectRepo: projectRepo,
 		charRepo: charRepo, sceneRepo: sceneRepo, itemRepo: itemRepo,
 		taskRepo: taskRepo, pointsRepo: pointsRepo, settingRepo: settingRepo,
-		queue: q,
+		queue: q, resultDir: resultDir, ffmpegPath: ffmpegPath,
 	}
 }
 
@@ -71,6 +78,66 @@ func (h *FirstFrameHandler) ownedEpisode(episodeID, userID string) (*model.Episo
 		return nil, errors.New("无权访问")
 	}
 	return ep, nil
+}
+
+// planAssets 收集这一集可发给规划模型的场景图与角色图（已压成 data URL）。
+//
+// 顺序上场景优先：空间布局是这张全景图最核心的信息。
+// 只收有图的资产；单张转换失败就跳过，不让一张坏图拖垮整个规划。
+// 上限 6 张：再多请求体会明显变大，模型也看不过来。
+func (h *FirstFrameHandler) planAssets(episodeID string) []service.PlanAsset {
+	const maxAssets = 6
+	out := make([]service.PlanAsset, 0, maxAssets)
+
+	add := func(name, kind, refURL string) {
+		if len(out) >= maxAssets || strings.TrimSpace(name) == "" {
+			return
+		}
+		refURL = strings.TrimSpace(refURL)
+		if refURL == "" || strings.Contains(refURL, "placeholder://") {
+			return
+		}
+		// 资产图可能是本机 /static 路径，也可能是上游 COS 外链，两种都支持
+		src := refURL
+		if !strings.HasPrefix(refURL, "http://") && !strings.HasPrefix(refURL, "https://") {
+			local, ok := h.localStaticPath(refURL)
+			if !ok {
+				return
+			}
+			src = local
+		}
+		dataURL, err := service.InlineImage(h.ffmpegPath, src, 768)
+		if err != nil {
+			log.Printf("首帧规划：跳过「%s」的参考图（%v）", name, err)
+			return
+		}
+		out = append(out, service.PlanAsset{Name: name, Kind: kind, DataURL: dataURL})
+	}
+
+	if scenes, err := h.sceneRepo.ListByEpisodeID(episodeID); err == nil {
+		for _, s := range scenes {
+			add(s.Name, "scene", s.ReferenceImage)
+		}
+	}
+	if chars, err := h.charRepo.ListByEpisodeID(episodeID); err == nil {
+		for _, c := range chars {
+			add(c.Name, "character", c.ReferenceImage)
+		}
+	}
+	return out
+}
+
+// localStaticPath 把 /static/results/xxx.png 映射到磁盘绝对路径
+func (h *FirstFrameHandler) localStaticPath(url string) (string, bool) {
+	const prefix = "/static/results/"
+	if !strings.HasPrefix(url, prefix) {
+		return "", false // 外链或别的目录，本地读不到
+	}
+	rel := strings.TrimPrefix(url, prefix)
+	if rel == "" || strings.Contains(rel, "..") {
+		return "", false
+	}
+	return filepath.Join(h.resultDir, filepath.FromSlash(rel)), true
 }
 
 // Plan 让 LLM 把这一集的分镜归并成若干首帧图分组，并整批覆盖旧分组。
@@ -101,7 +168,15 @@ func (h *FirstFrameHandler) Plan(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 180*time.Second)
 	defer cancel()
 
-	groups, err := service.PlanFirstFrames(ctx, client, frames)
+	// 把这一集的场景图和角色图一起喂给模型。
+	// 不看图的话，它写出的「桌子横在房间中部」是凭空想象的，
+	// 和场景资产图的实际布局对不上 —— 生成的首帧图自然「座位不对」。
+	assets := h.planAssets(episodeID)
+	if len(assets) > 0 {
+		log.Printf("首帧规划：附上 %d 张资产参考图（%s）", len(assets), cfg.DisplayName)
+	}
+
+	groups, err := service.PlanFirstFrames(ctx, client, frames, assets)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
@@ -141,6 +216,15 @@ func (h *FirstFrameHandler) Plan(c *gin.Context) {
 }
 
 // List 这一集的首帧图分组
+// ffGroupView 首帧分组 + 最近一次生成任务的状态。
+// 前端靠 taskStatus 判断「失败」并结束等待 —— 只看 image 是否为空的话，
+// 任务失败后图永远是空的，界面会一直转圈到轮询超时。
+type ffGroupView struct {
+	model.FirstFrame
+	TaskStatus string `json:"taskStatus,omitempty"`
+	TaskError  string `json:"taskError,omitempty"`
+}
+
 func (h *FirstFrameHandler) List(c *gin.Context) {
 	userID := middleware.CurrentUserID(c)
 	episodeID := c.Param("id")
@@ -153,7 +237,23 @@ func (h *FirstFrameHandler) List(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list})
+
+	ids := make([]string, 0, len(list))
+	for _, g := range list {
+		ids = append(ids, g.ID)
+	}
+	latest, _ := h.taskRepo.LatestByAssetIDs("firstframe", "group", ids)
+
+	out := make([]ffGroupView, 0, len(list))
+	for _, g := range list {
+		v := ffGroupView{FirstFrame: g}
+		if t := latest[g.ID]; t != nil {
+			v.TaskStatus = t.Status
+			v.TaskError = t.ErrorMsg
+		}
+		out = append(out, v)
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": out})
 }
 
 // UpdateGroup 手动改一组的描述或覆盖的段（规划结果不理想时用）
@@ -279,6 +379,20 @@ func (h *FirstFrameHandler) Generate(c *gin.Context) {
 			}
 			if sc, e := h.sceneRepo.GetByID(s.ID); e == nil {
 				scenes = append(scenes, *sc)
+			}
+		}
+		// 分镜漏标场景时兜底：这一集只有一个场景资产，就认定是它。
+		//
+		// 为什么会漏标：分镜走规则引擎降级时（LLM 没配 key 或调用失败），
+		// 场景是按「剧本里有没有出现场景名」做关键词匹配的。
+		// 剧本写「老师办公室」、资产叫「教师办公室-白天」，就一条都匹配不上，
+		// 于是整段 scenes 为空 → 首帧凑不到 2 张参考图 → 整组被跳过，
+		// 用户看到「已提交 0 张首帧图」，但场景图其实一直在库里。
+		//
+		// 只有一个场景时不存在歧义，直接用；多个场景才跳过让人工确认。
+		if len(scenes) == 0 {
+			if all, e := h.sceneRepo.ListByEpisodeID(episodeID); e == nil && len(all) == 1 {
+				scenes = all
 			}
 		}
 

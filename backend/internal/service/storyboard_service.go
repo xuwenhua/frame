@@ -19,7 +19,7 @@ func NewStoryboardService() *StoryboardService {
 
 // FrameDraft 生成中的分镜草稿
 type FrameDraft struct {
-	FrameIndex  int
+	FrameIndex int
 	// EpisodeNo 第几集，只用于描述词里的「场次：1-3」
 	EpisodeNo   int
 	Text        string
@@ -43,6 +43,13 @@ type FrameDraft struct {
 	// Shots 一帧内的多个镜头。参考站的一条视频描述词通常包含 2-3 个 ｜镜头N｜，
 	// 时间累计（0–5秒 / 5–8秒 / 8–13秒）；为空时用上面平铺的字段合成单镜。
 	Shots []FrameShot
+
+	// 尾帧画面：这一段结束时人物 / 环境 / 道具的状态。
+	// 逐段生成时它是下一段唯一的上文依据 —— 人物位置和姿态靠它"传下去"，
+	// 而不是让模型每段各自回忆。
+	EndFrameCharacter string
+	EndFrameEnv       string
+	EndFrameProp      string
 
 	// Duration 这一帧的出片时长（秒）。工具栏选「自动」时按内容估算，
 	// 落库后前端直接读它显示，提交视频也用它。
@@ -92,7 +99,95 @@ func (s *StoryboardService) Generate(
 		draft.Duration = EstimateFrameDuration(draft)
 		drafts = append(drafts, draft)
 	}
-	return drafts
+	// 一段剧本里常塞 3-4 句台词（80-100 字 = 21-26 秒），超过 H3 单段
+	// 15 秒上限。拆成多帧各出一片，绝不截断台词。
+	return splitLongDialogueFrames(drafts, 15)
+}
+
+// sentenceEndRe 按句末标点切句，标点跟着前一句走
+var sentenceEndRe = regexp.MustCompile(`[^。！？!?\n]+[。！？!?]?`)
+
+func splitSentences(s string) []string {
+	parts := sentenceEndRe.FindAllString(s, -1)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// splitLongDialogueFrames 单镜台词超过单帧上限时，按句末标点拆成多帧。
+//
+// 为什么必须拆：H3 单段上限 15 秒（约 55 字）。以前的做法是把台词
+// condense 到 60 字直接截断，用户看到的就是「最后一句台词说不完」；
+// 光取消截断也不行 —— 80 字硬塞进 15 秒是 5.3 字/秒，快到嘴都跟不上。
+// 正确做法是拆：宁可拆成两段各出一片，也不能把台词砍掉或催成快进。
+func splitLongDialogueFrames(drafts []FrameDraft, limit int) []FrameDraft {
+	if limit <= 0 || limit > 15 {
+		limit = 15
+	}
+	out := make([]FrameDraft, 0, len(drafts))
+	for _, d := range drafts {
+		shots := normalizeShots(d)
+		// 只处理单镜超长；多镜交给 splitOverlongFrames
+		if len(shots) != 1 || frameDurationNeed(d) <= float64(limit) {
+			out = append(out, d)
+			continue
+		}
+		groups := packDialogue(shots[0].Dialogues, limit)
+		if len(groups) <= 1 {
+			out = append(out, d) // 单句就超长，拆不动，交给上游压语速
+			continue
+		}
+		for i, g := range groups {
+			nd := d
+			sh := shots[0]
+			sh.Dialogues = g
+			nd.Shots = []FrameShot{sh}
+			nd.Dialogues = g
+			if i > 0 {
+				nd.Text = strings.TrimSpace(d.Text) + "（续）"
+			}
+			nd.Duration = EstimateFrameDuration(nd)
+			nd.VideoPrompt = BuildFrameVideoPrompt(nd, nd.Duration)
+			out = append(out, nd)
+		}
+	}
+	for i := range out {
+		out[i].FrameIndex = i + 1
+		out[i].Text = renumberText(out[i].Text, i+1)
+	}
+	return out
+}
+
+// packDialogue 把台词按句子装箱，保证每箱念完不超过 limit 秒
+func packDialogue(lines []FrameDialogue, limit int) [][]FrameDialogue {
+	// 留 1 秒给起句和收尾，其余按 3.8 字/秒折算
+	maxChars := int(float64(limit-1) * 3.8)
+	if maxChars < 10 {
+		maxChars = 10
+	}
+	var groups [][]FrameDialogue
+	var cur []FrameDialogue
+	curChars := 0
+	for _, dl := range lines {
+		for _, sent := range splitSentences(dl.Line) {
+			n := len([]rune(sent))
+			if len(cur) > 0 && curChars+n > maxChars {
+				groups = append(groups, cur)
+				cur = nil
+				curChars = 0
+			}
+			cur = append(cur, FrameDialogue{Role: dl.Role, Tone: dl.Tone, Line: sent})
+			curChars += n
+		}
+	}
+	if len(cur) > 0 {
+		groups = append(groups, cur)
+	}
+	return groups
 }
 
 // splitScript 把剧本拆成可拍摄的段落
@@ -324,16 +419,18 @@ func buildText(d FrameDraft, raw string) string {
 // 规则引擎路径给不出台词/音效，动作描述用原文压一句兜底；
 // 真正的结构由 BuildFrameVideoPrompt 统一负责，保证和 LLM 路径输出一致。
 func buildVideoPrompt(d FrameDraft, raw string) (string, FrameDraft) {
-	if strings.TrimSpace(d.Action) == "" {
-		d.Action = condense(raw, 60)
-	}
-	// 剧本里的台词常写成「**老师：** 台词」，规则引擎整段抠进 Action，
-	// 拆出来才能按时长估算、并输出标准的【角色台词】行
+	// 台词必须在**完整原文**上拆，绝不能先 condense 再拆。
+	// condense 是给「画面动作描述」限长的（60 字），拿它截台词会把后半句
+	// 直接砍掉 —— 实测 4 段台词全断在 53 字，用户看到的就是
+	// 「最后一句台词说不完」，模型照着半句念，当然接不上。
 	if len(d.Dialogues) == 0 {
-		if action, lines := splitInlineDialogues(d.Action); len(lines) > 0 {
-			d.Action = action
+		if action, lines := splitInlineDialogues(raw); len(lines) > 0 {
+			d.Action = condense(action, 60)
 			d.Dialogues = lines
 		}
+	}
+	if strings.TrimSpace(d.Action) == "" {
+		d.Action = condense(raw, 60)
 	}
 	if strings.TrimSpace(d.ShotSize) == "" {
 		d.ShotSize = "中景"

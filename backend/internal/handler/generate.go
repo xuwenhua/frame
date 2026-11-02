@@ -239,6 +239,115 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 	})
 }
 
+// panoramaPrompt 柱形全景图的编辑指令。
+//
+// 要点：不是「扩展成 2:1」这么简单 —— 必须强调左右两端是同一个位置（无缝），
+// 否则转 360 视频时接缝处会裂开一条明显的缝。
+const panoramaPrompt = "根据参考图生成柱形全景图：360 度等距柱状投影，横向展开，" +
+	"左右两端首尾相接、能无缝衔接；保持参考图里的房间布局、家具、材质、配色和光线完全一致；" +
+	"不要出现人物、文字、水印、边框。"
+
+// GeneratePanorama 把场景参考图扩展成柱形全景图。
+//
+// 用图片编辑模型（图生图），不是文生图 —— 场景图已经定了这间屋子长什么样，
+// 要让模型「往外延伸」而不是「重新画一个房间」。
+func (h *GenerateHandler) GeneratePanorama(c *gin.Context) {
+	userID := middleware.CurrentUserID(c)
+	var req struct {
+		SceneID string `json:"sceneId" binding:"required"`
+		ModelID string `json:"modelId"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 sceneId"})
+		return
+	}
+	sc, err := h.sceneRepo.GetByID(req.SceneID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "场景不存在"})
+		return
+	}
+	if strings.TrimSpace(sc.ReferenceImage) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "这个场景还没有参考图，先生成场景图"})
+		return
+	}
+	if strings.TrimSpace(req.ModelID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "请选择图片编辑模型（图生图）"})
+		return
+	}
+
+	cost := pointCost(h.settingRepo, "points_image", 2)
+	params, _ := json.Marshal(map[string]interface{}{
+		// 只传一张：这个工作流默认必传一张（476），477 及 490-496 都是可选位。
+		// 之前把同一张填进两个必填位，上游直接报 805 工作流执行失败。
+		"refImages": []string{sc.ReferenceImage},
+		// 全景图要宽幅，9:16 竖图转 360 会严重变形；工作流没有 2:1，16:9 最接近
+		"aspect": "16:9",
+	})
+	task, cerr := h.createTask(userID, "panorama", "scene", sc.ID, sc.EpisodeID,
+		req.ModelID, panoramaPrompt, string(params), cost)
+	if cerr != nil {
+		if errors.Is(cerr, repository.ErrInsufficientPoints) {
+			c.JSON(http.StatusPaymentRequired, gin.H{"code": 402, "message": "积分不足，本次需要 " + itoa(cost) + " 积分"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": cerr.Error()})
+		return
+	}
+	h.queue.Enqueue(task.ID)
+
+	balance, _ := h.pointsRepo.Balance(userID)
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0, "message": "已开始生成柱形全景图",
+		"data": gin.H{"task": task, "cost": cost, "balance": balance},
+	})
+}
+
+// GeneratePanoramaVideo 把柱形全景图转成 360 全景视频（panorama-to-360video 工作流）。
+//
+// 这个工作流只有一个输入图位，没有提示词/时长/画幅节点。
+func (h *GenerateHandler) GeneratePanoramaVideo(c *gin.Context) {
+	userID := middleware.CurrentUserID(c)
+	var req struct {
+		SceneID string `json:"sceneId" binding:"required"`
+		ModelID string `json:"modelId" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "缺少 sceneId 或 modelId"})
+		return
+	}
+	sc, err := h.sceneRepo.GetByID(req.SceneID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "场景不存在"})
+		return
+	}
+	if strings.TrimSpace(sc.PanoramaImage) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "还没有柱形全景图，先生成全景图"})
+		return
+	}
+
+	cost := pointCost(h.settingRepo, "points_video", 35)
+	params, _ := json.Marshal(map[string]interface{}{
+		"refImages": []string{sc.PanoramaImage},
+	})
+	task, cerr := h.createTask(userID, "panorama_video", "scene", sc.ID, sc.EpisodeID,
+		req.ModelID, "", string(params), cost)
+	if cerr != nil {
+		if errors.Is(cerr, repository.ErrInsufficientPoints) {
+			c.JSON(http.StatusPaymentRequired, gin.H{"code": 402, "message": "积分不足，本次需要 " + itoa(cost) + " 积分"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": cerr.Error()})
+		return
+	}
+	h.queue.Enqueue(task.ID)
+
+	balance, _ := h.pointsRepo.Balance(userID)
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0, "message": "已开始生成 360 全景视频",
+		"data": gin.H{"task": task, "cost": cost, "balance": balance},
+	})
+}
+
 // BatchGenerateImages 批量生成某集的所有资产图
 // 支持与单张生成一致的工具栏选项（模型 / 分辨率 / 角色样式 / 场景样式）
 func (h *GenerateHandler) BatchGenerateImages(c *gin.Context) {
@@ -279,7 +388,7 @@ func (h *GenerateHandler) BatchGenerateImages(c *gin.Context) {
 	balance, _ := h.pointsRepo.Balance(userID)
 	if balance < totalCost {
 		c.JSON(http.StatusPaymentRequired, gin.H{
-			"code": 402,
+			"code":    402,
 			"message": "积分不足，本批需要 " + itoa(totalCost) + " 积分（当前 " + itoa(balance) + "）",
 		})
 		return
@@ -627,11 +736,37 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard) []frameRefSlot 
 		out = append(out, frameRefSlot{URL: u, Name: name, Kind: kind})
 	}
 
-	// 场景全景参考图优先放第一张：H3 的节点只有 ref_images（参考图），
-	// 没有 first_frame 输入 —— 这张图不是「第一帧」，只提供空间布局、人物外观和光线，
-	// 镜头景别与运镜由模型按每段描述自己完成。
+	// 整集资产：一是拿场景名，二是给正文兜底用
+	allChars, _ := h.charRepo.ListByEpisodeID(board.EpisodeID)
+	allScenes, _ := h.sceneRepo.ListByEpisodeID(board.EpisodeID)
+	allItems, _ := h.itemRepo.ListByEpisodeID(board.EpisodeID)
+
+	// 场景名：优先分镜自己标的，没有就用整集唯一的场景名
+	sceneName := ""
+	if len(board.Scenes) > 0 {
+		sceneName = strings.TrimSpace(board.Scenes[0].Name)
+	}
+	if sceneName == "" && len(allScenes) == 1 {
+		sceneName = strings.TrimSpace(allScenes[0].Name)
+	}
+
+	// 首帧图（= 定稿的场景全景）占第一张，并且**顶替**场景资产图。
+	//
+	// 为什么用场景名当它的名字：提示词里写的是「地点：@教师办公室-白天」，
+	// 只有名字对上，RewriteMentionsForModel 才会把它换成 <Picture 1>。
+	// 之前固定叫「场景全景参考」，提示词里的 @场景名 匹配不到，
+	// 首帧图虽然传了却没人引用。
+	//
+	// 为什么不再传场景资产图：同一间房的两个版本（一个空房、一个有人的定稿），
+	// 模型会纠结以谁为准；首帧图已经锁死了布局、光线和家具位置。
+	hasFirstFrame := false
 	if u := strings.TrimSpace(board.FirstFrameImage); usable(u) {
-		push(stripQuery(u), "场景全景参考", "scene")
+		name := sceneName
+		if name == "" {
+			name = "场景"
+		}
+		push(stripQuery(u), name, "scene")
+		hasFirstFrame = true
 	}
 
 	// 角色优先（说话视频靠角色形象驱动），再场景，最后道具。
@@ -652,17 +787,48 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard) []frameRefSlot 
 		push(r.URL, r.Name, r.Kind)
 	}
 
-	for _, s := range board.Scenes {
-		if s.ID == "" {
+	// 正文兜底：@ 到、但 rolesJson 里没标的角色也要进图位。
+	// LLM 生成分镜时经常只在正文里写「@学生」，roleNames 却没给 ——
+	// 结果是学生在这段里说着话，图位里却只有老师，模型只能凭空编一张脸。
+	knownChar := map[string]bool{}
+	for _, r := range board.Roles {
+		knownChar[r.Name] = true
+	}
+	for _, c := range allChars {
+		if knownChar[c.Name] {
 			continue
 		}
-		if sc, err := h.sceneRepo.GetByID(s.ID); err == nil {
-			scenes = append(scenes, frameRefSlot{URL: sc.ReferenceImage, Name: sc.Name, Kind: "scene"})
+		if strings.Contains(board.VideoPrompt, "@"+c.Name) {
+			push(c.ReferenceImage, c.Name, "character")
 		}
 	}
-	sortRefSlotsByName(scenes)
-	for _, s := range scenes {
-		push(s.URL, s.Name, s.Kind)
+
+	if !hasFirstFrame {
+		for _, s := range board.Scenes {
+			if s.ID == "" {
+				continue
+			}
+			if sc, err := h.sceneRepo.GetByID(s.ID); err == nil {
+				scenes = append(scenes, frameRefSlot{URL: sc.ReferenceImage, Name: sc.Name, Kind: "scene"})
+			}
+		}
+		sortRefSlotsByName(scenes)
+		for _, s := range scenes {
+			push(s.URL, s.Name, s.Kind)
+		}
+		// 正文兜底：场景名在提示词里出现但 scenesJson 没标
+		knownScene := map[string]bool{}
+		for _, s := range board.Scenes {
+			knownScene[s.Name] = true
+		}
+		for _, sc := range allScenes {
+			if knownScene[sc.Name] {
+				continue
+			}
+			if strings.Contains(board.VideoPrompt, "@"+sc.Name) {
+				push(sc.ReferenceImage, sc.Name, "scene")
+			}
+		}
 	}
 
 	for _, it := range board.Items {
@@ -676,6 +842,19 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard) []frameRefSlot 
 	sortRefSlotsByName(items)
 	for _, it := range items {
 		push(it.URL, it.Name, it.Kind)
+	}
+	// 道具兜底：正文里 @ 到但 itemsJson 没标
+	knownItem := map[string]bool{}
+	for _, it := range board.Items {
+		knownItem[it.Name] = true
+	}
+	for _, it := range allItems {
+		if knownItem[it.Name] {
+			continue
+		}
+		if strings.Contains(board.VideoPrompt, "@"+it.Name) {
+			push(it.ReferenceImage, it.Name, "item")
+		}
 	}
 
 	if len(out) == 0 {

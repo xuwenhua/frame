@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,6 +33,9 @@ type AppConfig struct {
 	// 草图要的是「黑白线条、构图准确」，跟出资产图的模型诉求不同，
 	// 所以单独指定，不动全局默认图像模型。
 	SketchModelID string `yaml:"sketch_model_id"`
+	// FFmpegPath ffmpeg 可执行文件路径（留空或 "ffmpeg" 则走系统 PATH）。
+	// 成片合成把一集的多段分镜拼成一条，依赖它。
+	FFmpegPath string `yaml:"ffmpeg_path"`
 }
 
 type DatabaseConfig struct {
@@ -57,15 +62,15 @@ type JWTConfig struct {
 }
 
 type PointsConfig struct {
-	IdentifyCost  int `yaml:"identify_cost"`
-	ImagePerCost  int `yaml:"image_per_cost"`
-	VideoPerCost  int `yaml:"video_per_cost"`
+	IdentifyCost int `yaml:"identify_cost"`
+	ImagePerCost int `yaml:"image_per_cost"`
+	VideoPerCost int `yaml:"video_per_cost"`
 }
 
 type AIConfig struct {
-	OpenAI    OpenAIConfig    `yaml:"openai"`
+	OpenAI     OpenAIConfig     `yaml:"openai"`
 	RunningHub RunningHubConfig `yaml:"runninghub"`
-	Doubao    DoubaoConfig    `yaml:"doubao"`
+	Doubao     DoubaoConfig     `yaml:"doubao"`
 }
 
 type OpenAIConfig struct {
@@ -95,5 +100,34 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
+	// 路径里的 ~ 在这里统一展开，配置文件就能跨平台通用。
+	cfg.App.ResultDir = expandHome(cfg.App.ResultDir)
+	cfg.Database.DSN = expandHome(cfg.Database.DSN)
+
 	return &cfg, nil
+}
+
+// expandHome 把路径开头的 ~ 展开成当前用户主目录。
+//
+// 为什么需要：原配置写死了 /Users/xuwenhua/...（作者是 macOS），
+// 换到 Windows 上 SQLite 会去当前盘根目录找 \Users\xuwenhua\，直接
+// "unable to open database file"。改成 ~ 之后 Windows 展开成
+// C:\Users\<你>、Linux 展开成 /home/<你>，同一份配置到哪都能跑。
+func expandHome(p string) string {
+	if len(p) == 0 || p[0] != '~' {
+		return p
+	}
+	// 只支持 ~ 和 ~/ ~\ ，~user 这种写法原样返回
+	if len(p) > 1 && p[1] != '/' && p[1] != '\\' {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	rest := strings.TrimLeft(p[1:], "/\\")
+	if rest == "" {
+		return home
+	}
+	return filepath.Join(home, rest)
 }

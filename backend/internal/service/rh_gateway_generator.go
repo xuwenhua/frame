@@ -355,7 +355,24 @@ func (g *RHGatewayGenerator) runResumable(ctx context.Context, spec *RHWorkflowS
 				}
 				return "", "", fmt.Errorf("「%s」执行失败（errorCode=%s）: %s",
 					spec.Label, displayOr(string(st.ErrorCode), "-"), truncateStr(reason, 200))
-			case "QUEUED", "RUNNING", "":
+			case "QUEUED", "RUNNING":
+				continue
+			case "":
+				// 空状态 + 错误码 = 上游已经把这条任务丢了：
+				// 在 RunningHub 后台手动取消、任务被清理、或超过保留期都会这样
+				// （errorCode 1004「Task not found」）。
+				//
+				// 以前这里和 QUEUED/RUNNING 一样 continue，于是任务永远卡在
+				// 「生成中」——用户明明在网关取消了，本地还在傻等。
+				if code := string(st.ErrorCode); code != "" {
+					reason := st.ErrorMessage
+					if reason == "" {
+						reason = "上游未返回原因"
+					}
+					return "", "", fmt.Errorf("「%s」任务已在上游失效（errorCode=%s）：%s",
+						spec.Label, code, truncateStr(reason, 200))
+				}
+				// 空状态但没错误码：偶发的状态抖动，继续等下一轮
 				continue
 			default:
 				continue

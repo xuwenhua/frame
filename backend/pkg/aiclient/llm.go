@@ -30,9 +30,37 @@ func NewLLMClient(baseURL, apiKey, model string) *LLMClient {
 	}
 }
 
+// ChatMessage 一条对话消息。
+//
+// Content 用 any：OpenAI 兼容协议里它可以是纯字符串，
+// 也可以是多模态数组（文本 + 图片）。视觉模型必须走后者 ——
+// 只能传 string 的话，模型永远看不到参考图。
 type ChatMessage struct {
 	Role    string `json:"role"` // system / user / assistant
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+// ContentPart 多模态消息里的一段内容
+type ContentPart struct {
+	Type     string    `json:"type"` // text / image_url
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+// ImageURL 图片来源：http(s) 公网地址，或 data:image/jpeg;base64,xxx
+type ImageURL struct {
+	URL string `json:"url"`
+}
+
+// TextPart 构造一段文本
+func TextPart(s string) ContentPart {
+	return ContentPart{Type: "text", Text: s}
+}
+
+// ImagePart 构造一段图片。url 传 data URL 最稳：
+// 我们的图存在本机 /static 下，远端模型服务下载不到这个相对路径。
+func ImagePart(url string) ContentPart {
+	return ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: url}}
 }
 
 type chatRequest struct {

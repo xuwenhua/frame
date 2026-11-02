@@ -2,8 +2,10 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -221,12 +223,12 @@ func (q *Queue) process(taskID string) {
 	finish := time.Now()
 	q.db.Model(&model.GenerationTask{}).Where("id = ?", taskID).
 		Updates(map[string]interface{}{
-			"status":       "succeeded",
-			"progress":     100,
-			"result_url":   resultURL,
-			"result_json":  resultJSON,
-			"finished_at":  finish,
-			"updated_at":   finish,
+			"status":      "succeeded",
+			"progress":    100,
+			"result_url":  resultURL,
+			"result_json": resultJSON,
+			"finished_at": finish,
+			"updated_at":  finish,
 		})
 
 	// 回写业务表
@@ -266,27 +268,64 @@ func (q *Queue) writeBack(task *model.GenerationTask, url string) {
 		q.db.Model(&model.Character{}).Where("id = ?", task.AssetID).
 			Update("reference_image", url)
 	case "scene":
-		q.db.Model(&model.Scene{}).Where("id = ?", task.AssetID).
-			Update("reference_image", url)
+		// 场景有三种产出，按任务类型分流，别互相覆盖：
+		//   普通出图 → reference_image
+		//   柱形全景图 → panorama_image
+		//   360 全景视频 → panorama_video
+		switch task.Type {
+		case "panorama":
+			q.db.Model(&model.Scene{}).Where("id = ?", task.AssetID).
+				Update("panorama_image", url)
+		case "panorama_video":
+			q.db.Model(&model.Scene{}).Where("id = ?", task.AssetID).
+				Update("panorama_video", url)
+		default:
+			q.db.Model(&model.Scene{}).Where("id = ?", task.AssetID).
+				Update("reference_image", url)
+		}
 	case "item":
 		q.db.Model(&model.Item{}).Where("id = ?", task.AssetID).
 			Update("reference_image", url)
 	case "frame":
-		q.db.Model(&model.Storyboard{}).Where("id = ?", task.AssetID).
-			Updates(map[string]interface{}{"video_url": url, "duration": 13})
+		// 时长绝不能用硬编码：以前写死 13（默认模型 Seedance 的时长），
+		// 换了 H3 工作流后出 3/5/7 秒的片子，writeBack 却把分镜的
+		// duration 统一改成 13 —— 卡片显示 13 秒、描述词写 0.00–3.00s，
+		// 用户以为时长对不上，其实是这里写坏的。
+		updates := map[string]interface{}{"video_url": url}
+		if d := taskDuration(task.Params); d > 0 {
+			updates["duration"] = d
+		}
+		q.db.Model(&model.Storyboard{}).Where("id = ?", task.AssetID).Updates(updates)
 	}
 }
 
-// Recover 重启后把中断的任务捞回队列
-// running：上次进程被 kill，状态卡在 running
-// pending：只落了库、还没被消费（内存队列重启即丢），必须一并捞回来
+// taskDuration 取任务参数里用户选定的出片时长（秒），取不到返回 0
+func taskDuration(params string) int {
+	if strings.TrimSpace(params) == "" {
+		return 0
+	}
+	var p struct {
+		Duration int `json:"duration"`
+	}
+	if json.Unmarshal([]byte(params), &p) != nil {
+		return 0
+	}
+	return p.Duration
+}
+
 // Recover 重启后恢复中断的任务
 //
 // 分两种情况，不能一律重跑：
-//   - 已经拿到上游 taskId 的：说明任务真的提交过，重新跑会重复烧额度。
-//     这类恢复成 pending 即可，处理器会带 externalTaskID 走「续查」。
-//   - 卡在 running 太久（超过 30 分钟）的：上游大概率早没了，
-//     直接判失败并退积分，否则用户会看到一条永远「生成中」的僵尸任务。
+//   - 已经拿到上游 taskId 的：说明任务真的提交过。上游结果 24 小时内可取，
+//     重新入队会走「续查」（处理器带 externalTaskID 直接查状态/取产物），
+//     不会重新 /task/add，所以**无论卡多久都不该判失败**。
+//   - 没拿到上游 taskId 的（提交都没成功）：用时间兜底判失败并退积分，
+//     否则用户会看到一条永远「生成中」的僵尸任务。
+//
+// 曾经的 bug：一刀切「卡超过 30 分钟就判失败」，但视频上游本来就要跑
+// 20–45 分钟（queue 里 video 的超时也是 45 分钟）。服务中途重启一次，
+// 正在跑的视频任务全被判定「中断失败」，而上游其实早就出片了 ——
+// 用户看到一片失败，实际视频在 COS 上躺到 24 小时后过期。
 func (q *Queue) Recover() {
 	var stuck []model.GenerationTask
 	q.db.Where("status IN ?", []string{"running", "pending"}).Find(&stuck)
@@ -295,14 +334,17 @@ func (q *Queue) Recover() {
 		return
 	}
 
-	staleAfter := 30 * time.Minute
+	// 兜底阈值必须大于视频任务超时（45 分钟），否则正常在跑的任务会被误杀
+	staleAfter := 60 * time.Minute
 	now := time.Now()
 	resumed, expired := 0, 0
 
 	for _, t := range stuck {
-		// 卡太久的直接判失败（上游结果早就取不到了）
-		if t.Status == "running" && t.StartedAt != nil && now.Sub(*t.StartedAt) > staleAfter {
-			q.fail(&t, fmt.Errorf("任务中断超过 %d 分钟，已判定失败。积分已退回，可重新生成",
+		// 已提交到上游的任务永不判失败：重新入队会走续查，能直接取回产物。
+		// 只有「连上游 ID 都没拿到」的才算真丢了，用时间兜底判失败。
+		hasUpstream := strings.TrimSpace(t.ExternalTaskID) != ""
+		if !hasUpstream && t.Status == "running" && t.StartedAt != nil && now.Sub(*t.StartedAt) > staleAfter {
+			q.fail(&t, fmt.Errorf("任务中断超过 %d 分钟且未提交到上游，已判定失败。积分已退回，可重新生成",
 				int(staleAfter/time.Minute)))
 			expired++
 			continue
@@ -313,5 +355,5 @@ func (q *Queue) Recover() {
 		q.Enqueue(t.ID)
 		resumed++
 	}
-	log.Printf("恢复了 %d 个中断任务，判定 %d 个超时任务失败", resumed, expired)
+	log.Printf("恢复了 %d 个中断任务（含上游续查），判定 %d 个超时任务失败", resumed, expired)
 }

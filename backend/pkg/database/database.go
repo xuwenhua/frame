@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
@@ -27,6 +29,13 @@ func Init(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 
 	switch cfg.Driver {
 	case "sqlite":
+		// 库文件的父目录可能还不存在（首次启动），先建出来，
+		// 否则 SQLite 只会报 "unable to open database file"，看不出是目录缺失。
+		if dir := filepath.Dir(cfg.DSN); dir != "" && dir != "." {
+			if e := os.MkdirAll(dir, 0o755); e != nil {
+				return nil, fmt.Errorf("创建数据库目录失败 %s: %w", dir, e)
+			}
+		}
 		db, err = gorm.Open(sqlite.Open(cfg.DSN), gormConfig)
 	case "postgres":
 		dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
@@ -45,7 +54,20 @@ func Init(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 	// SQLite 只允许一个写者。批量出图会同时插入/更新大量任务，
 	// 多连接并发写会直接撞 SQLITE_BUSY 导致任务被静默丢弃。
 	// 这里把连接池收到 1：所有读写串行，单条 SQL 都在毫秒级，对本项目完全够用。
+	//
+	// 注意顺序：PRAGMA 必须在收窄连接池之前执行，且连接池设为「1 个连接 +
+	// 永不过期」后不会再重建连接，所以这里设一次就能长期生效
+	// （busy_timeout 是 per-connection 的，连接一重建就丢）。
 	if cfg.Driver == "sqlite" {
+		for _, pragma := range []string{
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA synchronous=NORMAL",
+			"PRAGMA busy_timeout=5000",
+		} {
+			if e := db.Exec(pragma).Error; e != nil {
+				log.Printf("设置 %s 失败（可忽略）: %v", pragma, e)
+			}
+		}
 		if sqlDB, err := db.DB(); err == nil {
 			sqlDB.SetMaxOpenConns(1)
 			sqlDB.SetMaxIdleConns(1)

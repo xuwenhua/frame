@@ -83,10 +83,10 @@ var RHWorkflows = []RHWorkflowSpec{
 	},
 	{
 		Name: "qwen-image-2.1-pe", Label: "Qwen 图像编辑 2.1", Kind: "image",
-		Desc:       "图生图/换装换背景，需 2 张参考图（{{ref 1}}/{{ref 2}}）",
+		Desc:       "图生图/换装换背景；默认必传 1 张参考图（476 必填，477 及 490-496 可选）",
 		PromptNode: "497", AspectNode: "13", AspectOptions: RHComfyAspectOptions,
 		ImageNodes:  []string{"476", "477", "490", "491", "492", "493", "494", "495", "496"},
-		RequiredImg: 2, DefaultAspect: "9:16",
+		RequiredImg: 1, DefaultAspect: "9:16",
 	},
 	{
 		Name: "krea2-text2img", Label: "Krea2 文生图", Kind: "image",
@@ -120,6 +120,54 @@ var RHWorkflows = []RHWorkflowSpec{
 		RequiredImg:   1,
 		DurationNode:  "259",
 		DefaultAspect: "9:16", DefaultDuration: 10,
+	},
+	{
+		// 7 图 3 音频 + Ref2VA 结构化提示词 + 时长 + 画幅版（aiAppId 2116514530440753153）。
+		//
+		// 和 minimax-h3-final 那套节点完全不是一回事，不能混用：
+		//   - 图位 7 个：139 / 256 / 257 / 258 / 259 / 260 / 270
+		//   - 音频位 3 个：267 / 268 / 269
+		//   - 提示词走 265（注意 final 是 263，这里错一位就整段丢失）
+		//   - 时长走 132（秒，工作流自身默认 3）
+		//   - 画幅走 115，COMBO 类型，选项与 RHComfyAspectOptions 逐项一致
+		//     （1:1 / 2:3 / 3:2 / 3:4 / 4:3 / 9:16 / 16:9 / 21:9）。
+		//
+		//     注意默认值有两个说法：115 节点自身的 default 是 "1:1 (Square)"，
+		//     而网关文档 desc 写的是「默认 9:16」。这里 DefaultAspect 取 9:16 ——
+		//     本项目是短剧平台，前端工具栏只会传 9:16 / 16:9，方图没有意义；
+		//     而且 BuildRHInputs 只要 AspectNode 非空就一定会显式填值，
+		//     节点自身的 1:1 默认永远不会生效，不受这个分歧影响。
+		//
+		// ⚠️ 259 在这条工作流里是「图位」，不是「时长节点」：
+		// final 那套的 259 是 value(时长)，这里 259 是第 5 张参考图。
+		// 照着 final 的 spec 复制粘贴，时长数字会顶掉第 5 张图且不报错。
+		//
+		// 画幅一律走 NormalizeAspect 转成「比例 (描述)」的完整写法：
+		// 115 节点的默认值就是这个格式，说明节点认完整枚举；
+		// 传裸 "9:16" 在同类 ResolutionSelector 节点上会抛 KeyError → 上游 805。
+		//
+		// 提示词建议按 Ref2VA 六段式写（subject_definitions / 场次 / summary /
+		// retention_analysis / detailed_description），这是这条工作流的设计用法。
+		Name: "minimax-h3-i2v-7img", Label: "MiniMax H3 图生视频（7 图）", Kind: "video",
+		Desc:       "7 图 + 3 音频 + 结构化提示词；时长走 132，画幅走 115",
+		PromptNode: "265",
+		ImageNodes: []string{"139", "256", "257", "258", "259", "260", "270"},
+		AudioNodes: []string{"267", "268", "269"},
+		// 参考视频位 272：喂 360 全景视频，模型能看清整个空间，
+		// 不用再从单张场景图猜房间其余角度
+		VideoNode:   "272",
+		RequiredImg: 1,
+		AspectNode:  "115", AspectOptions: RHComfyAspectOptions,
+		DurationNode:  "132",
+		DefaultAspect: "9:16", DefaultDuration: 3,
+	},
+	{
+		// 柱形全景图转 360 全景视频。只有一个输入图位（2），
+		// 没有提示词 / 时长 / 画幅节点 —— 这三项留空，BuildRHInputs 就不会硬塞。
+		Name: "panorama-to-360video", Label: "柱形全景图转 360 视频", Kind: "video",
+		Desc:        "输入一张柱形全景图（equirectangular），输出 360 全景视频",
+		ImageNodes:  []string{"2"},
+		RequiredImg: 1,
 	},
 	{
 		Name: "minimax-h3-remake", Label: "MiniMax H3 视频复刻", Kind: "video",

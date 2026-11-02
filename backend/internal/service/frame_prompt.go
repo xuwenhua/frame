@@ -5,6 +5,7 @@ import (
 	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"jikeai-clone/internal/model"
@@ -89,31 +90,61 @@ func frameDurationNeed(d FrameDraft) float64 {
 
 // shotsDurationNeed 一组镜头需要多少秒（不夹 15 秒上限）
 //
-// 必须和 BuildFrameVideoPrompt 的分配口径完全一致：逐镜取 max(台词念完所需, 底线)，
-// 再相加。之前是「镜头数 × 2.5 与台词总需求取大」，两套口径对不上 ——
-// 3 个镜头实际要 11.5 秒，这里只算出 9.8 秒，按 10 秒分配时
-// 4.55 秒的台词镜头只分到 4 秒，生成出来就是话没说完就切镜。
+// 与 BuildFrameVideoPrompt 共用 planShotSeconds，保证「分镜卡片上的时长」
+// 和「描述词里的时间轴」永远是同一个数。
 func shotsDurationNeed(shots []FrameShot) float64 {
-	total := 0.0
+	_, sum := planShotSeconds(shots)
+	return float64(sum)
+}
+
+// planShotSeconds 给每个镜头分配秒数，返回逐镜秒数与总和。
+//
+// 这是时长计算的**唯一口径**：EstimateFrameDuration（卡片显示的秒数）
+// 和 BuildFrameVideoPrompt（描述词里的 [Shot N] 起止秒）都必须走这里。
+//
+// 曾经是两套算法：Estimate 用「浮点累加 + 0.4 呼吸 + 统一 ceil」，
+// Build 用「逐镜 ceil 再相加」。同样 8 个字的一句台词，
+// 前者算出 4 秒、后者算出 3 秒 —— 于是卡片显示 4 秒、描述词写 0.00–3.00s。
+//
+// 规则：
+//   - 有台词：按 3.8 字/秒念完所需，最低 2.5 秒（1 秒的镜头模型来不及进入说话状态）
+//   - 纯动作/空镜：用 LLM 建议的秒数，底线 2 秒
+func planShotSeconds(shots []FrameShot) ([]int, int) {
+	if len(shots) == 0 {
+		return []int{3}, 3
+	}
+
+	need := make([]float64, len(shots))
 	spoken := false
-	for _, sh := range shots {
-		n := shotSpeakSeconds(sh)
-		if n > 0 {
+	for i := range shots {
+		n := shotSpeakSeconds(shots[i])
+		if n <= 0 {
+			n = float64(shots[i].Seconds)
+			if n < 2 {
+				n = 2
+			}
+		} else {
 			spoken = true
-			// 有台词：念完所需秒数，最低 2.5 秒（1 秒的镜头模型来不及进入说话状态）
 			if n < 2.5 {
 				n = 2.5
 			}
-		} else {
-			// 纯动作/空镜：底线 2 秒
-			n = 2
 		}
-		total += n
+		need[i] = n
 	}
+
+	// 有台词的帧在末尾留 0.4 秒呼吸：模型收句、画面落幅都需要余量。
+	// 只加在最后一镜，不逐镜加 —— 三镜各加 0.4 会把 3 秒的段撑成 5 秒。
 	if spoken {
-		total += 0.4 // 全帧头尾各留一点呼吸
+		need[len(need)-1] += 0.4
 	}
-	return total
+
+	secs := make([]int, len(need))
+	sum := 0
+	for i := range need {
+		secs[i] = int(math.Ceil(need[i]))
+		sum += secs[i]
+	}
+	return secs, sum
 }
 
 // EstimateFrameDuration 按这一帧的内容估算该多长（秒）
@@ -124,22 +155,17 @@ func shotsDurationNeed(shots []FrameShot) float64 {
 //
 // 两者取大，向上取整，夹在 [3, 15]（上游时长节点支持的范围）。
 func EstimateFrameDuration(d FrameDraft) int {
-	shots := normalizeShots(d)
-	n := len(shots)
-	if n == 0 {
-		n = 1
+	// 与 BuildFrameVideoPrompt 共用 planShotSeconds：
+	// 卡片显示的秒数必须等于描述词时间轴的总长，否则会出现
+	// 「卡片 4 秒 / 描述词 0.00–3.00s」这种自相矛盾。
+	_, sum := planShotSeconds(normalizeShots(d))
+	if sum < 3 {
+		sum = 3
 	}
-
-	est := frameDurationNeed(d)
-
-	sec := int(math.Ceil(est))
-	if sec < 3 {
-		sec = 3
+	if sum > 15 {
+		sum = 15
 	}
-	if sec > 15 {
-		sec = 15
-	}
-	return sec
+	return sum
 }
 
 // BuildFrameVideoPrompt 按参考站的格式拼「视频描述词」
@@ -334,11 +360,13 @@ func briefIdentity(s string) string {
 	if i := strings.IndexAny(s, "。；;"); i > 0 {
 		s = s[:i]
 	}
-	r := []rune(s)
-	if len(r) > 20 {
-		return string(r[:20]) + "…"
+	// 只取前两段（性别/年龄最关键，职业看角色名就知道）。
+	// 原来按 20 字硬截，会切在词中间变成「招生咨…」，比不给还难看。
+	parts := strings.Split(s, "，")
+	if len(parts) > 2 {
+		parts = parts[:2]
 	}
-	return s
+	return strings.TrimSpace(strings.Join(parts, "，"))
 }
 
 // shotSubject 取这一镜的主体（景别写成「中景/老师」里的那个「老师」）：
@@ -395,6 +423,45 @@ func facingLine(sh FrameShot, d FrameDraft) string {
 //
 // 为什么换成这个写法：之前每帧 1200 字，堆了人物锁定、视觉风格、全局规则，
 // 模型反而抓不住「这一镜拍什么」。参考站的 8 行结构在同样的模型上更稳。
+// BuildFrameVideoPrompt 拼「视频描述词」。格式对齐参考站（即刻AI）：
+//
+//	[出镜角色-物品-场景]:       人物 / 场景 / 物品 清单一览
+//	角色-声线绑定:              谁用什么嗓音
+//	【素材与场景状态】          时间、地点、光线、人物站位
+//	|镜头1| 0-5秒| 双人中景|     每镜：动作 → 台词 → 音效
+//
+// 为什么不再用官方 Ref2VA 的 summary / detailed_description 结构：
+// 这条链路的工作流（minimax-h3-i2v-7img）内部自带 Qwen H3 Prompt 优化节点，
+// 会把我们给的结构化文本再加工一遍 —— 两层 schema 叠在一起反而互相打架，
+// 优化节点需要的是「人读得懂的自然语言」，不是又一版 JSON 式骨架。
+//
+// 台词不再包 <d>[Chinese]</d>：参考站也是纯中文引号，语言交给优化节点。
+// 注意：若以后切到 noopt 工作流（去掉优化节点），需要把语言标记加回去，
+// 否则模型可能不知道用中文念。
+// BuildFrameVideoPrompt 拼「视频描述词」，按 H3 分镜脚本的字段格式：
+//
+//	场次：1-1
+//	地点：@教师办公室-白天 右侧推拉窗的自然光斜射入室
+//	时间：日 / 内
+//	人物：@老师（男，52岁），中年男中低音；@学生（男，18岁），年轻男声
+//	物品：@深蓝色保温杯，@专业介绍册
+//
+//	镜号：1
+//	景别：双人中景
+//	运镜：固定机位
+//	情绪/动作：@老师 抬右手示意 @学生 落座，目光落在 @学生 脸上
+//	台词：@老师：<d>[Chinese] 坐。你说对土木有兴趣，又怕“就是去工地”。</d>
+//	音效：椅背轻响、窗外隐约环境声
+//	时长：6s
+//
+// 为什么用这套字段：这是 H3 工作流（minimax-h3-i2v-7img）里验证过的真实写法，
+// 模型对「镜号/景别/运镜/情绪动作/台词/音效/时长」这些字段边界最清楚，
+// 比紧凑的 |镜头N| 或 Ref2VA 的 [Shot N] 都稳。
+//
+// 人物/场景/道具一律写 @名字，**不写死 @图片N**：
+// 图位顺序是「首帧图 → 角色 → 场景 → 道具」（见 frameRefSlots），
+// 和示例里的「角色→角色→场景」不同，写死编号必然错位。
+// 提交时 RewriteMentionsForModel 会按真实顺序换成 <Picture N>。
 func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 	shots := normalizeShots(d)
 
@@ -403,41 +470,13 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 		duration = EstimateFrameDuration(d)
 	}
 
-	var b strings.Builder
-	b.WriteString(frameSceneHeader(d))
-	b.WriteString("\n")
-
 	// ---- 每镜秒数 ----
-	// 铁律：有台词的镜头必须够念完。
-	// 之前是「按权重把总时长等比切开」—— 内容需要 11.5 秒、工具栏给 10 秒时，
-	// 4.55 秒的台词镜头只分到 4 秒，生成出来就是话没说完就切镜、口型跟着错。
-	// 现在改成：台词镜头按需求给足，富余时间只补给纯动作镜头。
-	secs := make([]int, len(shots))
-	sum := 0
-	for i := range shots {
-		n := shotSpeakSeconds(shots[i])
-		if n <= 0 {
-			// 纯动作镜头：LLM 建议几秒就几秒，底线 2 秒
-			n = float64(shots[i].Seconds)
-			if n < 2 {
-				n = 2
-			}
-		} else if n < 2.5 {
-			// 有台词最短 2.5 秒：1 秒的镜头模型来不及进入说话状态，
-			// 实测会出现「音频 0.02 秒就开口、画面第 3 秒才动嘴」
-			n = 2.5
-		}
-		secs[i] = int(math.Ceil(n))
-		sum += secs[i]
-	}
-	if len(secs) == 0 {
-		secs = []int{3}
-		sum = 3
-	}
+	// 铁律：有台词的镜头必须够念完。统一走 planShotSeconds，
+	// 保证和 EstimateFrameDuration 算出同一个总数。
+	secs, sum := planShotSeconds(shots)
 
-	// 工具栏时长比需求长：把富余时间补给纯动作镜头（每镜最多 +2 秒）。
+	// 工具栏时长比需求长：富余时间只补给纯动作镜头（每镜最多 +2 秒）。
 	// 台词镜头不加 —— 加长了模型会把语速拖慢，反而更容易和口型错开。
-	// 全是台词镜头时余量不给：给谁都会稀释那一镜的语速。
 	if extra := duration - sum; extra > 0 {
 		for i := range shots {
 			if extra <= 0 {
@@ -456,8 +495,7 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 		}
 	}
 
-	// H3 单段上限 15 秒，超了只能压：先压纯动作镜头，压完还超就从最长的台词镜头里扣。
-	// 单镜一段时这是硬限制（拆不了），语速会落到「偏快」，模型自己会赶。
+	// H3 单段上限 15 秒，超了只能压：先压纯动作镜头，压完还超再从最长台词镜头扣
 	if sum > 15 {
 		over := sum - 15
 		for pass := 0; pass < 2 && over > 0; pass++ {
@@ -466,7 +504,7 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 					break
 				}
 				if pass == 0 && shotSpeakSeconds(shots[i]) > 0 {
-					continue // 第一轮不动台词镜头
+					continue
 				}
 				cut := secs[i] - 2
 				if cut > over {
@@ -481,145 +519,238 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 		}
 	}
 
-	// ---- 官方 Ref2VA 结构：summary 一句话概括 → detailed_description 装镜头 ----
-	sceneName := "未指定场景"
-	if len(d.Scenes) > 0 {
-		sceneName = d.Scenes[0].Name
-	}
+	var b strings.Builder
+
+	// 字幕约束放最前：台词用中文引号或纯文本时，模型容易把内容画成画面文字
+	b.WriteString("（画面中不得出现任何字幕或文字：台词只用于配音，不要以文字形式显示）\n\n")
+
 	epNo := d.EpisodeNo
 	if epNo <= 0 {
 		epNo = 1
 	}
-	b.WriteString("summary:\n")
-	if len(shots) == 1 {
-		fmt.Fprintf(&b, "Ref2VA 目标视频：第 %d-%d 场，%s，单镜头 %d 秒。\n", epNo, d.FrameIndex, sceneName, sum)
-	} else {
-		fmt.Fprintf(&b, "Ref2VA 目标视频：第 %d-%d 场，%s，%d 个镜头共 %d 秒。\n",
-			epNo, d.FrameIndex, sceneName, len(shots), sum)
+	fmt.Fprintf(&b, "场次：%d-%d\n", epNo, d.FrameIndex)
+	b.WriteString("地点：" + scenePlace(d) + "\n")
+	b.WriteString("时间：" + sceneTime(d) + "\n")
+	b.WriteString("人物：" + peopleWithVoice(d) + "\n")
+	// 站位必须单独一行、每段都写。
+	//
+	// 只靠首帧图锁不住位置：那张图是「空间基准」，模型构图时不会照搬，
+	// 而每段的景别/机位又各不相同 —— 没有文字写死「谁在桌子哪一侧」，
+	// 模型就会自由安排，于是同一场戏里两个人一会儿并排、一会儿前后、
+	// 甚至多出一个背影（实测第 8/13/18/22 段全乱，第 22 段还多画了一个人）。
+	if sit := standingLine(d); sit != "" {
+		b.WriteString("站位：" + sit + "\n")
 	}
-	b.WriteString("\ndetailed_description:\n")
+	if len(d.Items) > 0 {
+		b.WriteString("物品：" + mentionList(itemNames(d.Items), "无") + "\n")
+	}
 
-	// ---- 逐镜输出，结构照 H3 官方 ----
-	// [Shot N] 起止秒，景别，主体 +【主体】【动作】【镜头】【音效】【约束】
-	// 用绝对起止秒而不是相对「时长」：模型对「0.00–3.00s」这种时间轴比「3s」敏感，
-	// 也更容易把台词压在段内念完。
 	cursor := 0
 	for i, sh := range shots {
 		start := cursor
 		end := start + secs[i]
 		cursor = end
 
+		fmt.Fprintf(&b, "\n镜号：%d\n", i+1)
 		size := fallbackText(sh.ShotSize, "中景")
-		sub := shotSubject(sh, d)
-
-		// 官方时间轴写法：[Shot 1] 0.00–3.00s，用绝对秒而不是「3s」，
-		// 模型对「从 0.00 到 3.00」这种区间比对一个相对时长更敏感
-		head := fmt.Sprintf("[Shot %d] %.2f–%.2fs，%s", i+1, float64(start), float64(end), size)
-		if sub != "" {
-			// 主体带 @：RewriteMentionsForModel 会换成 <Picture N>
-			head += "，主体 @" + sub
+		// 景别里点名了角色（「老师中近景」）就是单人镜头，另一个人不该入画 ——
+		// 不点明的话模型会顺手把对面的人也画进来，看起来就像多了一个人
+		if name := singleShotSubject(size, d.Roles); name != "" {
+			size += "（画面里只出现 @" + name + "，其他人不入画）"
 		}
-		b.WriteString(head + "\n")
+		b.WriteString("景别：" + size + "\n")
+		b.WriteString("运镜：" + fallbackText(sh.Camera, "固定机位") + "\n")
 
-		// 【主体】谁是主体 + 这一镜开始时每个人在哪（承接上一镜的结果）
-		if st := strings.TrimSpace(sh.State); st != "" {
-			if sub != "" {
-				b.WriteString("【主体】@" + sub + " 为主体；起始：" + strings.TrimRight(st, "。；，、 ") + "\n")
-			} else {
-				b.WriteString("【主体】起始：" + strings.TrimRight(st, "。；，、 ") + "\n")
-			}
-		} else if sub != "" {
-			b.WriteString("【主体】@" + sub + " 为主体\n")
-		}
+		act := strings.TrimRight(strings.TrimSpace(fallbackText(sh.Action, "延续人物当前动作，画面自然推进")), "。；")
+		b.WriteString("情绪/动作：" + act + "。\n")
 
-		// 【动作】动作和台词绑在一起（官方写法：台词是时间线动作的一部分）
 		lines := make([]FrameDialogue, 0, len(sh.Dialogues))
 		for _, dl := range sh.Dialogues {
 			if strings.TrimSpace(dl.Line) != "" {
 				lines = append(lines, dl)
 			}
 		}
-
-		act := strings.TrimRight(strings.TrimSpace(fallbackText(sh.Action, "延续人物当前动作，画面自然推进")), "。；")
-		b.WriteString("【动作】" + act)
 		if len(lines) == 0 {
-			// 明说「不开口」：只说「台词：无」模型有时还是会自己编一句
-			b.WriteString("（本镜无台词，不要开口）\n")
-		} else {
-			// 「…，温和平稳、语速平稳地说：」——怎么说和做什么写在同一句里
-			b.WriteString("，" + speechCue(lines, secs[i]) + "：\n")
-			for _, dl := range lines {
-				role := "@" + fallbackText(dl.Role, "角色")
-				// 语言标签用官方的 [Chinese]（不是 [中文]）：H3 按方括号里的
-				// 语言名决定用哪种语言发音，写中文名有些版本识别不到
-				if tag := speakerTag(d, dl.Role); tag != "" {
-					fmt.Fprintf(&b, "%s %s <d>[Chinese] %s</d>\n", tag, role, strings.TrimSpace(dl.Line))
-				} else {
-					fmt.Fprintf(&b, "%s <d>[Chinese] %s</d>\n", role, strings.TrimSpace(dl.Line))
+			// 明说「不开口」：只留空模型会自己编一句台词
+			b.WriteString("台词：无\n")
+		}
+		for _, dl := range lines {
+			role := fallbackText(dl.Role, "角色")
+			// 语气写在角色名后的括号里：示例格式没有这一项，但语气直接决定表演，
+			// 丢了模型会按字面平铺直叙。
+			tone := strings.TrimSpace(dl.Tone)
+			// 语速只给定性区间；语气里已经写了「语速」就不再重复追加
+			if !strings.Contains(tone, "语速") {
+				if s := speechRateLabel(float64(dialogueChars([]FrameDialogue{dl})) / float64(secs[i])); s != "" {
+					if tone == "" {
+						tone = s
+					} else {
+						tone += "，" + s
+					}
 				}
 			}
-			// 短句必须点明「说完就停」：只给 1 个字却分到 2 秒时，
-			// 不写这句模型会把那个字拖满整镜，正好赶上切镜
-			if dialogueChars(lines) <= 3 {
-				b.WriteString("说完即停，剩下的时间留出动作，不要拖长音。\n")
+			if tone != "" {
+				fmt.Fprintf(&b, "台词：@%s（%s）：<d>[Chinese] %s</d>\n", role, tone, strings.TrimSpace(dl.Line))
+			} else {
+				fmt.Fprintf(&b, "台词：@%s：<d>[Chinese] %s</d>\n", role, strings.TrimSpace(dl.Line))
 			}
 		}
 
-		// 【镜头】景别 + 运镜 + 朝向
-		shotLine := "【镜头】" + size
-		if sub != "" {
-			shotLine += "，主体 @" + sub
-		}
-		shotLine += "，" + fallbackText(sh.Camera, "固定机位")
-		if face := facingLine(sh, d); face != "" {
-			shotLine += "；" + face
-		}
-		b.WriteString(shotLine + "\n")
-
-		b.WriteString("【音效】" + fallbackText(strings.TrimSpace(sh.SFX), "无") + "\n")
-
-		// 【约束】每个镜头都写：口型同步是硬要求，写一次模型会忘
-		b.WriteString("【约束】五官稳定，面部不扭曲，口型与台词同步，画面无跳变；")
-		b.WriteString("人物外观与服装前后一致，光线一致")
-		if i == 0 {
-			b.WriteString("；人物位置按【主体】里的站位，全程不换座、不绕桌走动")
-		}
-		b.WriteString("\n")
-
-		if i < len(shots)-1 {
-			b.WriteString("\n")
-		}
+		b.WriteString("音效：" + fallbackText(strings.TrimSpace(sh.SFX), "无") + "\n")
+		fmt.Fprintf(&b, "时长：%ds\n", secs[i])
 	}
 
-	// 全片约束：只留跨镜头才会出错的几条，镜头级的都写进各自的【约束】里
-	b.WriteString("\n【全片约束】台词只念 <d>[Chinese]</d> 里的正文，标签本身和方括号里的语言名不念；")
-	b.WriteString("每句台词在所在 Shot 的起止秒内念完，念完才切下一个 Shot；")
-	b.WriteString("只有正在说话的角色动嘴，其他人闭口；")
+	// ---- 执行要点 ----
+	// 参考站/示例里没有这块，但这几条都是踩过坑的硬约束
+	// （字幕、动作被提前做完、没说话的人也在动嘴、自己加 BGM）。
+	b.WriteString("\n【执行要点】\n")
+	// 人数约束：不写的话，过肩/双人镜头里模型会多画一个「前景背影」，
+	// 剪出来就是凭空多了一个人（实测第 22 段出现过两个学生）
+	if n := len(d.Roles); n > 0 {
+		fmt.Fprintf(&b, "画面里只出现人物行列出的这 %d 个角色，不要增加路人、背景人物或前景背影；", n)
+	}
+	b.WriteString("台词只用来配音，**不要生成任何字幕**，画面里不许出现文字、标题、角标、水印、logo；")
 	b.WriteString("台词里要求的动作（如「坐」「过来」）说到时才发生，不得提前；")
-	b.WriteString("不生成字幕、水印、logo，不要 BGM，只保留同期声。\n")
+	b.WriteString("每句台词在所在镜头内念完，念完才切下一个镜头；")
+	b.WriteString("只有正在说话的角色动嘴，其他人闭口；")
+	b.WriteString("人物位置严格按「站位」行，全程不换座、不绕桌走动；单人镜头里其他人不入画；")
+	b.WriteString("不要 BGM，只保留同期声。\n")
 
-	// ---- overall_soundscape：只写场景世界内部真实存在的声音 ----
-	// 按官方规范，这一栏不放背景音乐；各镜的【音效】去重后汇总到这里，
-	// 让模型对整个片段的声音底有一个整体印象，而不是逐镜零散地听
-	sfx := make([]string, 0, len(shots))
-	seenSfx := map[string]bool{}
-	for _, sh := range shots {
-		s := strings.TrimSpace(sh.SFX)
-		if s == "" || s == "无" || seenSfx[s] {
+	return b.String()
+}
+
+// standingLine 这一帧的人物站位：谁在哪一侧、坐着还是站着、身体朝谁
+//
+// 优先用第一镜的 State（LLM 给的起始状态，最准）；
+// 没有就退回 Situation 里描述站位的那半句；再没有就按人数给个兜底。
+func standingLine(d FrameDraft) string {
+	if shots := normalizeShots(d); len(shots) > 0 {
+		if s := strings.TrimSpace(shots[0].State); s != "" {
+			return s
+		}
+	}
+	// Situation 是「时间 + 地点 + 站位」混在一起的一段，取最后一个句号之后的部分
+	if s := strings.TrimSpace(d.Situation); s != "" {
+		if i := strings.LastIndex(s, "。"); i > 0 && i < len(s)-1 {
+			if tail := strings.TrimSpace(s[i+len("。"):]); tail != "" {
+				return tail
+			}
+		}
+	}
+	// 兜底：两人场景按「隔桌相对」写死，总比不写强
+	if len(d.Roles) == 2 {
+		return "@" + d.Roles[0].Name + " 与 @" + d.Roles[1].Name +
+			" 隔着桌子相对而坐，身体互相朝向、视线交汇，各自固定在自己的座位"
+	}
+	return ""
+}
+
+// scenePlace 地点行：@场景名 + 空间布局描述
+func scenePlace(d FrameDraft) string {
+	if len(d.Scenes) == 0 {
+		return "沿用前序镜头的场景"
+	}
+	sc := d.Scenes[0]
+	out := "@" + sc.Name
+	if a := strings.TrimSpace(sc.SpatialAnchor); a != "" {
+		out += " " + a
+	}
+	return out
+}
+
+// sceneTime 时间行
+func sceneTime(d FrameDraft) string {
+	if len(d.Scenes) > 0 {
+		if t := strings.TrimSpace(d.Scenes[0].TimeOfDay); t != "" {
+			return t
+		}
+	}
+	return "日 / 内"
+}
+
+// peopleWithVoice 人物行：@角色（身份），音色
+//
+// 音色写在人物行里（示例是「音色参考@音频1」）：我们没有音频资产，
+// 用文字音色代替，模型同样能据此选嗓音。
+func peopleWithVoice(d FrameDraft) string {
+	if len(d.Roles) == 0 {
+		return "无"
+	}
+	parts := make([]string, 0, len(d.Roles))
+	for _, r := range d.Roles {
+		name := strings.TrimSpace(r.Name)
+		if name == "" {
 			continue
 		}
-		seenSfx[s] = true
-		sfx = append(sfx, s)
+		s := "@" + name
+		if brief := briefIdentity(r.IdentityAnchor); brief != "" {
+			s += "（" + brief + "）"
+		}
+		tone := strings.TrimSpace(r.VoiceTone)
+		if tone == "" {
+			tone = SuggestVoiceTone(r.IdentityAnchor, r.Personality)
+		}
+		if tone = briefTone(tone); tone != "" {
+			s += "，" + tone
+		}
+		parts = append(parts, s)
 	}
-	b.WriteString("\noverall_soundscape:\n")
-	if len(sfx) > 0 {
-		b.WriteString(strings.Join(sfx, "；") + "。\n")
-	} else {
-		b.WriteString("场景环境底噪，无额外音效。\n")
+	if len(parts) == 0 {
+		return "无"
 	}
-	// 我们出片后再配 BGM，生成阶段不加，按官方写法填 N/A
-	b.WriteString("\nnon_diegetic_music: N/A\n")
+	return strings.Join(parts, "；")
+}
 
+// singleShotSubject 景别里点名的角色（「老师中近景」→ 老师），没有就返回空
+func singleShotSubject(size string, roles []model.Character) string {
+	for _, r := range roles {
+		if n := strings.TrimSpace(r.Name); n != "" && strings.Contains(size, n) {
+			return n
+		}
+	}
+	return ""
+}
+
+// briefTone 音色只取第一段：「中年男中低音：中低音域，沙哑温厚…」→「中年男中低音」
+func briefTone(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexAny(s, "：:，,。"); i > 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
+// sceneSituation 拼【素材与场景状态】：时间、地点、光线，外加人物站位。
+//
+// 参考站这一段是一整段自然语言，站位写在最后一句 ——
+// 模型（尤其带优化节点的那种）对「谁坐在哪一侧」这种大白话最敏感。
+func sceneSituation(d FrameDraft) string {
+	// Situation 就是为这一段准备的：时间 + 地点 + 光线 + 站位，写好了一次性用
+	if s := strings.TrimSpace(d.Situation); s != "" {
+		return s
+	}
+	var b strings.Builder
+	if len(d.Scenes) > 0 {
+		sc := d.Scenes[0]
+		if t := strings.TrimSpace(sc.TimeOfDay); t != "" {
+			b.WriteString(t + "，")
+		}
+		b.WriteString("室内，@" + sc.Name + "。")
+		if a := strings.TrimSpace(sc.SpatialAnchor); a != "" {
+			b.WriteString(a + "。")
+		}
+		if l := strings.TrimSpace(sc.LightingPrompt); l != "" {
+			b.WriteString(l + "。")
+		}
+	} else {
+		b.WriteString("沿用前序镜头的场景与光线。")
+	}
+	// 站位取第一镜的起始状态：这一帧开场时人都在哪
+	if shots := normalizeShots(d); len(shots) > 0 {
+		if st := strings.TrimSpace(shots[0].State); st != "" {
+			b.WriteString(st + "。")
+		}
+	}
 	return b.String()
 }
 
@@ -632,12 +763,19 @@ func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
 // 只为了改两行不划算。这里就地补：纯文本处理，不动其他内容。
 //
 // 已经是 H3 结构（【Shot N｜…】）或没有台词时原样返回。
+// promptInlineToneRe 新格式把语气写在台词行括号里：台词：@老师（自然，语速平稳）：…
+var promptInlineToneRe = regexp.MustCompile(`(?m)^台词：@?[^（：:\n]+（[^）]+）[：:]`)
+
 func EnsureSpeechRate(vp string) string {
 	// 已经是官方时间轴结构（[Shot N] / 上一版【Shot N｜…】）或补过语气行的就跳过。
 	// 几个标志都要判：老格式补完 <d> 和语气行之后仍然是老格式，只看一个会重复插入。
+	//
+	// 新格式（场次/镜号/台词：@角色（语气）：）自带语气括号，也要跳过 ——
+	// 只判「语气：」这一行的话，会在下面再插一行重复的「语气：语速平稳」。
 	if strings.TrimSpace(vp) == "" ||
 		strings.Contains(vp, "[Shot ") || strings.Contains(vp, "【Shot ") ||
-		strings.Contains(vp, "语气：") {
+		strings.Contains(vp, "语气：") ||
+		promptInlineToneRe.MatchString(vp) {
 		return vp
 	}
 
@@ -890,12 +1028,70 @@ func cleanDialogueLine(s string) string {
 // 角色名可能带 (S1) 前缀和 @，台词外面包 <d> 标签
 var promptBlockLineRe = regexp.MustCompile(`(?m)^(?:\(S\d+\)\s*)?@?([^\s<]+)\s+<d>\s*(?:\[[^\]]*\]\s*)?(.+?)\s*</d>\s*$`)
 
+// promptQuoteLineRe 参考站格式的台词行：【@女主 台词】（满带欣喜，语调轻快而笃定）：正文
+//
+// 正文可能是中文引号包裹，也可能是 <d>[Chinese] 正文</d>，两种都收，
+// 解析时再统一清洗（见 cleanDialogueBody）。用贪婪 .+ 匹配到行尾 ——
+// 台词内部本身就可能带引号（「又怕“就是去工地”」），非贪婪会在内层引号处断开。
+var promptQuoteLineRe = regexp.MustCompile(`(?m)【@?([^】\s]+)\s*台词】(?:（([^）]*)）)?\s*[：:]?\s*(.+)\s*$`)
+
+// promptFieldDialogueRe 分镜脚本格式的台词行：台词：@老师（平缓笃定）：<d>[Chinese] 坐。</d>
+// 角色名后的括号是语气，不是名字的一部分 —— 之前没单独认这种写法，
+// 解析时会把「女主（满带欣喜）」整个当角色名，前端 chips 上就会多出一串语气词。
+var promptFieldDialogueRe = regexp.MustCompile(`(?m)^台词：\s*@?([^（：:\n]+?)\s*(?:（([^）]*)）)?\s*[：:]\s*(.+)$`)
+
+// promptTagRe 台词正文里需要剥掉的标记：<d> </d> [Chinese]
+var promptTagRe = regexp.MustCompile(`</?d>|\[[A-Za-z]+\]`)
+
+// cleanDialogueBody 去掉台词正文外层的引号和 <d> 标记，只留能念的文字
+func cleanDialogueBody(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "“")
+	s = strings.TrimSuffix(s, "”")
+	s = strings.TrimPrefix(s, `"`)
+	s = strings.TrimSuffix(s, `"`)
+	s = promptTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
+
 // ParsePromptDialogues 从已有描述词里按顺序抽出台词。
 //
 // 单帧「重新生成」只拿 f.Text（画面脚本，不含台词）喂给 LLM，
 // 结果新描述词里一句台词都没有 —— 用户点一次重新生成，台词就全丢了。
 func ParsePromptDialogues(videoPrompt string) []FrameDialogue {
-	// H3 结构优先：(S1) @老师 <d>[中文] 台词</d>
+	// 分镜脚本格式优先：台词：@老师（语气）：<d>[Chinese] 正文</d>
+	if ms := promptFieldDialogueRe.FindAllStringSubmatch(videoPrompt, -1); len(ms) > 0 {
+		out := make([]FrameDialogue, 0, len(ms))
+		for _, m := range ms {
+			role := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(m[1]), "@"))
+			line := cleanDialogueBody(m[3])
+			if role == "" || line == "" || line == "无" || line == "N/A" {
+				continue
+			}
+			out = append(out, FrameDialogue{Role: role, Tone: strings.TrimSpace(m[2]), Line: line})
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+
+	// 参考站格式：【@女主 台词】（语气）：正文（引号或 <d> 标签都收）
+	if ms := promptQuoteLineRe.FindAllStringSubmatch(videoPrompt, -1); len(ms) > 0 {
+		out := make([]FrameDialogue, 0, len(ms))
+		for _, m := range ms {
+			role := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(m[1]), "@"))
+			line := cleanDialogueBody(m[3])
+			if role == "" || line == "" || line == "无" || line == "N/A" {
+				continue
+			}
+			out = append(out, FrameDialogue{Role: role, Tone: strings.TrimSpace(m[2]), Line: line})
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+
+	// 旧 H3 结构：(S1) @老师 <d>[中文] 台词</d>
 	if ms := promptBlockLineRe.FindAllStringSubmatch(videoPrompt, -1); len(ms) > 0 {
 		out := make([]FrameDialogue, 0, len(ms))
 		for _, m := range ms {
@@ -1069,7 +1265,10 @@ func retentionAnalysis(names, kinds []string) string {
 		tag := fmt.Sprintf("<Picture %d>", i+1)
 		switch {
 		case kind == "scene" || strings.Contains(n, "场景全景"):
-			lines = append(lines, tag+"（"+n+"）：weak_reference — 只参考空间结构、家具布局与光线方向，构图与机位不照搬。")
+			// 用 partially_copy 而不是 weak_reference：weak_reference 语义上就是
+			// 「这张图只当背景，构图别管」，正是人物位置漂移的源头。
+			lines = append(lines, tag+"（"+n+"）：partially_copy — 空间布局、家具位置、光线方向、"+
+				"以及人物在画面中的左右位置与朝向全部锁定；只有景别远近与机位角度可以调整。")
 		case kind == "item":
 			lines = append(lines, tag+"（"+n+"）：fully_preserved — 颜色、材质、形状完整保留，不替换、不增减。")
 		default:
@@ -1090,8 +1289,13 @@ func subjectDefinition(n int, name, kind string) string {
 	tag := fmt.Sprintf("<Picture %d>", n)
 	switch {
 	case kind == "scene" || strings.Contains(name, "场景全景"):
-		return tag + " 是「" + name + "」：只参考空间结构、家具布局和光线方向；" +
-			"构图、景别和机位不照搬这张图。"
+		// 这里必须锁「人物在画面中的左右位置」，不能只说「参考空间结构」。
+		// 之前写的是「构图、景别和机位不照搬」—— 模型据此把这张图当纯背景，
+		// 每段自己重新摆人，于是同一场戏里两个人一会儿并排、一会儿左右互换、
+		// 甚至多出一个背影（实测第 8/13/18/22 段全乱）。
+		return tag + " 是「" + name + "」：空间结构、家具布局、光线方向，" +
+			"**以及每个人在画面中的左右位置、坐着还是站着、身体朝向**，全部以这张图为准；" +
+			"只允许改变景别远近和机位角度，不允许把人挪到另一侧、换座位或改变朝向。"
 	case kind == "item":
 		return tag + " 是「" + name + "」：颜色、材质、形状完整保留，" +
 			"不换成别的款式，也不要凭空替换或增减。"
@@ -1102,4 +1306,102 @@ func subjectDefinition(n int, name, kind string) string {
 		return tag + " 是「" + name + "」：外观、身份与材质完整保留，" +
 			"不因动作、表情或光线改变；姿态与表情随剧情变化。"
 	}
+}
+
+var (
+	// 两种时间轴写法都要认：
+	//
+	//	新格式（参考站风格）：|镜头1| 0-5秒| 双人中景|
+	//	旧格式（Ref2VA）    ：[Shot 1] 0.00–3.00s，双人中景
+	//
+	// 库里新旧数据混杂，只认一种会让另一批数据「改时长」时静默失效 ——
+	// 改完发现描述词没变，很容易误判成接口没生效。
+	//
+	// 捕获组：1=整个头部 2=Shot 编号 3=镜头编号 4=起始秒 5=结束秒
+	shotTimelineRe = regexp.MustCompile(`(\[Shot\s+(\d+)\]|\|镜头(\d+)\|)\s*(\d+(?:\.\d+)?)\s*[–—~～\-]\s*(\d+(?:\.\d+)?)\s*(?:s|秒)`)
+	// summary 里的秒数：单镜头 3 秒 / 3 个镜头共 13 秒（新格式没有这两行，匹配不到即不改）
+	summaryOneShotRe = regexp.MustCompile(`单镜头\s*\d+\s*秒`)
+	summaryMultiRe   = regexp.MustCompile(`共\s*\d+\s*秒`)
+)
+
+// RescalePromptDuration 把描述词里的时间轴整体缩放到 total 秒。
+//
+// 为什么需要：Duration 字段（分镜卡片上显示的秒数）和描述词里的
+// [Shot N] 起止秒是**两个独立存储的值**。PUT /storyboard/:id 允许只改
+// Duration 而不动描述词，于是出现「卡片显示 13 秒、描述词写 0.00–3.00s」。
+// 出片时传给时长节点的是 Duration，模型会把 3 秒的动作硬拉成 13 秒，
+// 后 10 秒基本是静止或重复 —— 这是最容易被当成「模型不动」的假象。
+//
+// 多镜头按原比例分配，累计取整保证最后一段正好落在 total，
+// 每段至少 1 秒（总时长小于镜头数时不再压缩）。
+func RescalePromptDuration(prompt string, total int) string {
+	if total <= 0 || strings.TrimSpace(prompt) == "" {
+		return prompt
+	}
+	matches := shotTimelineRe.FindAllStringSubmatchIndex(prompt, -1)
+	if len(matches) == 0 {
+		return prompt
+	}
+
+	type seg struct {
+		from, to int     // 在 prompt 里的字节区间
+		dur      float64 // 原时长
+		bracket  bool    // true = [Shot N] 旧格式；false = |镜头N| 新格式
+		no       string  // 镜头编号原文，替换时要保留
+	}
+	segs := make([]seg, 0, len(matches))
+	sum := 0.0
+	for _, m := range matches {
+		s, err1 := strconv.ParseFloat(prompt[m[8]:m[9]], 64)
+		e, err2 := strconv.ParseFloat(prompt[m[10]:m[11]], 64)
+		if err1 != nil || err2 != nil {
+			return prompt // 解析不了就原样返回，不做破坏性改写
+		}
+		if e <= s {
+			e = s + 1
+		}
+		sg := seg{from: m[0], to: m[1], dur: e - s}
+		if m[4] >= 0 { // 旧格式：[Shot N]
+			sg.bracket = true
+			sg.no = prompt[m[4]:m[5]]
+		} else { // 新格式：|镜头N|
+			sg.no = prompt[m[6]:m[7]]
+		}
+		segs = append(segs, sg)
+		sum += e - s
+	}
+	if sum <= 0 {
+		return prompt
+	}
+
+	var b strings.Builder
+	cursor, last := 0, 0
+	for i, sg := range segs {
+		d := int(math.Round(sg.dur / sum * float64(total)))
+		if d < 1 {
+			d = 1
+		}
+		end := cursor + d
+		if i == len(segs)-1 {
+			end = total // 最后一段收口，避免累计误差
+		}
+		if end <= cursor {
+			end = cursor + 1
+		}
+		b.WriteString(prompt[last:sg.from])
+		// 保持原来的写法，不把用户的格式换掉
+		if sg.bracket {
+			fmt.Fprintf(&b, "[Shot %s] %.2f–%.2fs", sg.no, float64(cursor), float64(end))
+		} else {
+			fmt.Fprintf(&b, "|镜头%s| %d-%d秒|", sg.no, cursor, end)
+		}
+		last = sg.to
+		cursor = end
+	}
+	b.WriteString(prompt[last:])
+
+	out := b.String()
+	out = summaryOneShotRe.ReplaceAllString(out, fmt.Sprintf("单镜头 %d 秒", total))
+	out = summaryMultiRe.ReplaceAllString(out, fmt.Sprintf("共 %d 秒", total))
+	return out
 }

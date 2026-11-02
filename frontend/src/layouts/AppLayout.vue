@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { useUserStore } from '../stores/user'
 
 const route = useRoute()
-const router = useRouter()
 const store = useUserStore()
 const scrolled = ref(false)
 const showUserMenu = ref(false)
