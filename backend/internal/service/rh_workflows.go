@@ -227,7 +227,7 @@ func RHDefaultWorkflow(kind string) *RHWorkflowSpec {
 // BuildRHInputs 按网关拼装 inputs
 //
 // 注意：只传「有值」的节点。曾按文档传 null 占位，上游一律 803 JsonNull。
-func BuildRHInputs(spec *RHWorkflowSpec, prompt, aspect string, images []string, video string, duration int) (map[string]interface{}, error) {
+func BuildRHInputs(spec *RHWorkflowSpec, prompt, aspect string, images []string, video string, audios []string, duration int) (map[string]interface{}, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("未指定工作流")
 	}
@@ -264,6 +264,17 @@ func BuildRHInputs(spec *RHWorkflowSpec, prompt, aspect string, images []string,
 		} else {
 			inputs[spec.VideoNode] = video
 		}
+	}
+
+	// 2.5 音频位：角色传了音色样本时才会用到（音色参考）
+	for i, a := range audios {
+		if i >= len(spec.AudioNodes) {
+			break
+		}
+		if strings.TrimSpace(a) == "" {
+			continue
+		}
+		inputs[spec.AudioNodes[i]] = a
 	}
 
 	// 3. 提示词

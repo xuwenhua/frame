@@ -585,12 +585,14 @@ func registerQueueHandlers(q *queue.Queue, db *gorm.DB, modelRepo *repository.Mo
 		vAspect := ""
 		vDuration := 0
 		vVideo := ""
+		var vAudios []string
 		if task.Params != "" {
 			var p struct {
 				RefImages   []string `json:"refImages"`
 				AspectRatio string   `json:"aspectRatio"`
 				Duration    int      `json:"duration"`
 				VideoURL    string   `json:"videoUrl"`
+				AudioURLs   []string `json:"audioUrls"`
 			}
 			if json.Unmarshal([]byte(task.Params), &p) == nil {
 				// 整份参考图都要传下去：提示词里 @ 了几个资产，上游就该收到几张图。
@@ -600,6 +602,7 @@ func registerQueueHandlers(q *queue.Queue, db *gorm.DB, modelRepo *repository.Mo
 				vAspect = p.AspectRatio
 				vDuration = p.Duration
 				vVideo = p.VideoURL
+				vAudios = p.AudioURLs
 			}
 		}
 
@@ -616,7 +619,7 @@ func registerQueueHandlers(q *queue.Queue, db *gorm.DB, modelRepo *repository.Mo
 				log.Printf("写入上游任务 ID 失败 %s: %v", task.ID, err)
 			}
 		}
-		return gen.Generate(ctx, prompt, refImages, vVideo)
+		return gen.Generate(ctx, prompt, refImages, vVideo, vAudios)
 	})
 
 	// 场景 → 柱形全景图（equirectangular 2:1）。
@@ -694,6 +697,6 @@ func registerQueueHandlers(q *queue.Queue, db *gorm.DB, modelRepo *repository.Mo
 				log.Printf("写入上游任务 ID 失败 %s: %v", task.ID, err)
 			}
 		}
-		return gen.Generate(ctx, "", refs, "")
+		return gen.Generate(ctx, "", refs, "", nil)
 	})
 }

@@ -710,6 +710,9 @@ func peopleWithVoice(d FrameDraft) string {
 		return "无"
 	}
 	parts := make([]string, 0, len(d.Roles))
+	// 音色是「音频」和「文字描述」二选一：传了参考音频就用音频，
+	// 没传才退回文字描述。编号按角色出现顺序，和出片时传音频的顺序一致。
+	audioIdx := 0
 	for _, r := range d.Roles {
 		name := strings.TrimSpace(r.Name)
 		if name == "" {
@@ -719,12 +722,17 @@ func peopleWithVoice(d FrameDraft) string {
 		if brief := briefIdentity(r.IdentityAnchor); brief != "" {
 			s += "（" + brief + "）"
 		}
-		tone := strings.TrimSpace(r.VoiceTone)
-		if tone == "" {
-			tone = SuggestVoiceTone(r.IdentityAnchor, r.Personality)
-		}
-		if tone = briefTone(tone); tone != "" {
-			s += "，" + tone
+		if strings.TrimSpace(r.VoiceSample) != "" {
+			audioIdx++
+			s += fmt.Sprintf("，音色参考@音频%d", audioIdx)
+		} else {
+			tone := strings.TrimSpace(r.VoiceTone)
+			if tone == "" {
+				tone = SuggestVoiceTone(r.IdentityAnchor, r.Personality)
+			}
+			if tone = briefTone(tone); tone != "" {
+				s += "，" + tone
+			}
 		}
 		parts = append(parts, s)
 	}

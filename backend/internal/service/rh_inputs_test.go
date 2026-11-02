@@ -21,7 +21,7 @@ func TestBuildRHInputsNoNullPlaceholders(t *testing.T) {
 		t.Fatal("找不到 minimax-h3-final")
 	}
 
-	inputs, err := BuildRHInputs(spec, "一个人说话", "9:16", []string{"/static/results/a.png"}, "", 0)
+	inputs, err := BuildRHInputs(spec, "一个人说话", "9:16", []string{"/static/results/a.png"}, "", nil, 0)
 	if err != nil {
 		t.Fatalf("构建失败: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestBuildRHInputsNoNullPlaceholders(t *testing.T) {
 // 259 是网关的 value 节点（时长）。不传就出 1.3 秒的片子。
 func TestBuildRHInputsSendsDuration(t *testing.T) {
 	spec := RHWorkflowByName("minimax-h3-final")
-	inputs, err := BuildRHInputs(spec, "p", "9:16", []string{"/a.png"}, "", 10)
+	inputs, err := BuildRHInputs(spec, "p", "9:16", []string{"/a.png"}, "", nil, 10)
 	if err != nil {
 		t.Fatalf("构建失败: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestBuildRHInputsSendsDuration(t *testing.T) {
 	}
 
 	// 不传时长时走工作流默认值，不能是 0
-	inputs, _ = BuildRHInputs(spec, "p", "9:16", []string{"/a.png"}, "", 0)
+	inputs, _ = BuildRHInputs(spec, "p", "9:16", []string{"/a.png"}, "", nil, 0)
 	if got, _ := inputs["259"].(int); got <= 0 {
 		t.Errorf("默认时长不应为 %v", inputs["259"])
 	}
@@ -97,7 +97,7 @@ func TestBuildRHInputsFillsAllImageNodes(t *testing.T) {
 	}
 
 	refs := []string{"/a.png", "/b.png", "/c.png", "/d.png"}
-	inputs, err := BuildRHInputs(spec, "p", "9:16", refs, "", 5)
+	inputs, err := BuildRHInputs(spec, "p", "9:16", refs, "", nil, 5)
 	if err != nil {
 		t.Fatalf("构建失败: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestBuildRHInputsFillsAllImageNodes(t *testing.T) {
 		}
 	}
 	// 空串不能占位
-	inputs, _ = BuildRHInputs(spec, "p", "9:16", []string{"/a.png", "", "/c.png"}, "", 5)
+	inputs, _ = BuildRHInputs(spec, "p", "9:16", []string{"/a.png", "", "/c.png"}, "", nil, 5)
 	if _, exists := inputs["49"]; exists {
 		t.Error("空参考图不应占用 49 号图位")
 	}
@@ -120,7 +120,7 @@ func TestBuildRHInputsFillsAllImageNodes(t *testing.T) {
 // 必填图不足要拦在前端侧，别把无效请求丢给上游
 func TestBuildRHInputsRequiresImage(t *testing.T) {
 	spec := RHWorkflowByName("minimax-h3-final")
-	if _, err := BuildRHInputs(spec, "p", "9:16", nil, "", 0); err == nil {
+	if _, err := BuildRHInputs(spec, "p", "9:16", nil, "", nil, 0); err == nil {
 		t.Error("缺少参考图时应当报错")
 	}
 }
@@ -131,7 +131,7 @@ func TestBuildRHInputsDigitalHuman(t *testing.T) {
 	if spec == nil {
 		t.Fatal("找不到 minimax-h3-digital-human")
 	}
-	inputs, err := BuildRHInputs(spec, "p", "16:9", []string{"/a.png", "/b.png"}, "https://x/v.mp4", 7)
+	inputs, err := BuildRHInputs(spec, "p", "16:9", []string{"/a.png", "/b.png"}, "https://x/v.mp4", nil, 7)
 	if err != nil {
 		t.Fatalf("构建失败: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestBuildRHInputsDigitalHuman(t *testing.T) {
 	}
 
 	// 缺输入视频必须报错（以前会静默传空串）
-	if _, err := BuildRHInputs(spec, "p", "16:9", []string{"/a.png", "/b.png"}, "", 0); err == nil {
+	if _, err := BuildRHInputs(spec, "p", "16:9", []string{"/a.png", "/b.png"}, "", nil, 0); err == nil {
 		t.Error("数字人缺少输入视频时应当报错")
 	}
 }
@@ -210,7 +210,7 @@ func TestH3SevenImageWorkflow(t *testing.T) {
 
 	refs := []string{"u1", "u2", "u3", "u4", "u5", "u6", "u7"}
 	// 故意传 aspect 和 duration，验证它们不会污染 inputs
-	inputs, err := BuildRHInputs(spec, "结构化提示词", "9:16", refs, "", 15)
+	inputs, err := BuildRHInputs(spec, "结构化提示词", "9:16", refs, "", nil, 15)
 	if err != nil {
 		t.Fatalf("构建失败: %v", err)
 	}
@@ -258,13 +258,13 @@ func TestH3SevenImageWorkflow(t *testing.T) {
 	}
 
 	// 至少 1 张图，一张都没有要报错
-	if _, err := BuildRHInputs(spec, "p", "", nil, "", 0); err == nil {
+	if _, err := BuildRHInputs(spec, "p", "", nil, "", nil, 0); err == nil {
 		t.Error("一张参考图都没有时应当报错")
 	}
 
 	// 超过 7 张要报错，不能静默丢弃
 	eight := append(append([]string{}, refs...), "u8")
-	if _, err := BuildRHInputs(spec, "p", "", eight, "", 0); err == nil {
+	if _, err := BuildRHInputs(spec, "p", "", eight, "", nil, 0); err == nil {
 		t.Error("超过 7 张参考图时应当报错")
 	}
 }
@@ -291,7 +291,7 @@ func TestH3SevenImageAspectVariants(t *testing.T) {
 		{"", "9:16 (Portrait Widescreen)"}, // 不传 → DefaultAspect 兜底
 	}
 	for _, c := range cases {
-		inputs, err := BuildRHInputs(spec, "p", c.want, refs, "", 0)
+		inputs, err := BuildRHInputs(spec, "p", c.want, refs, "", nil, 0)
 		if err != nil {
 			t.Errorf("画幅 %q 构建失败: %v", c.want, err)
 			continue

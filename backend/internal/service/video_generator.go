@@ -39,7 +39,7 @@ func NewVideoGenerator(cfg *model.ModelConfig) *VideoGenerator {
 //
 // 参考视频用于「让模型看清整个空间」：场景选了 360 全景视频时，
 // 它会进 H3 的 272 号视频位，模型不用再从单张场景图猜房间其余角度。
-func (g *VideoGenerator) Generate(ctx context.Context, prompt string, refs []string, video string) (string, string, error) {
+func (g *VideoGenerator) Generate(ctx context.Context, prompt string, refs []string, video string, audios []string) (string, string, error) {
 	if g.cfg == nil {
 		return "", "", fmt.Errorf("未配置视频模型")
 	}
@@ -65,7 +65,7 @@ func (g *VideoGenerator) Generate(ctx context.Context, prompt string, refs []str
 		gen := NewRHGatewayGenerator(g.cfg).WithLocalRoot(g.LocalRoot)
 		gen.OnTaskID = g.OnExternalTaskID
 		// 多图链路：H3 有 9 个图位，第 1 张进首帧位，其余进参考位
-		return gen.GenerateVideoWithRefs(ctx, prompt, cleaned, video)
+		return gen.GenerateVideoWithRefs(ctx, prompt, cleaned, video, audios)
 	case "doubao":
 		return g.callDoubao(ctx, prompt, firstFrame)
 	default:

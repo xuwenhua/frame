@@ -93,7 +93,7 @@ func (g *RHGatewayGenerator) GenerateImage(ctx context.Context, prompt string, r
 	if err != nil {
 		return "", "", err
 	}
-	inputs, err := BuildRHInputs(spec, prompt, g.str("aspectRatio", "9:16"), refs, "", 0)
+	inputs, err := BuildRHInputs(spec, prompt, g.str("aspectRatio", "9:16"), refs, "", nil, 0)
 	if err != nil {
 		return "", "", err
 	}
@@ -174,7 +174,7 @@ func (g *RHGatewayGenerator) GenerateVideo(ctx context.Context, prompt, firstFra
 	if strings.TrimSpace(firstFrame) != "" {
 		refs = []string{firstFrame}
 	}
-	return g.GenerateVideoWithRefs(ctx, prompt, refs, srcVideo)
+	return g.GenerateVideoWithRefs(ctx, prompt, refs, srcVideo, nil)
 }
 
 // GenerateVideoWithRefs 出片，refs 依次填入图位（第 1 张进 51 号首帧位）
@@ -182,7 +182,7 @@ func (g *RHGatewayGenerator) GenerateVideo(ctx context.Context, prompt, firstFra
 // 为什么需要多张：分镜提示词里 @ 了角色 / 场景 / 道具，
 // 只传真第一张的话，模型对其他资产完全没有视觉参照，
 // 只能靠文字描述现编，形象一致性会崩。
-func (g *RHGatewayGenerator) GenerateVideoWithRefs(ctx context.Context, prompt string, refs []string, srcVideo string) (string, string, error) {
+func (g *RHGatewayGenerator) GenerateVideoWithRefs(ctx context.Context, prompt string, refs []string, srcVideo string, audios []string) (string, string, error) {
 	if g.cfg.APIKey == "" {
 		return "", "", fmt.Errorf("RH 中转未配置 Token")
 	}
@@ -203,7 +203,14 @@ func (g *RHGatewayGenerator) GenerateVideoWithRefs(ctx context.Context, prompt s
 	if err != nil {
 		return "", "", err
 	}
-	inputs, err := BuildRHInputs(spec, prompt, g.str("aspectRatio", ""), refs, video, g.num("duration", 0))
+	// 音频也要换成网关能读的地址（本地 /static/uploads 它读不到）
+	if len(audios) > 0 {
+		audios, err = g.resolveRefs(ctx, audios)
+		if err != nil {
+			return "", "", fmt.Errorf("音色样本上传失败: %w", err)
+		}
+	}
+	inputs, err := BuildRHInputs(spec, prompt, g.str("aspectRatio", ""), refs, video, audios, g.num("duration", 0))
 	if err != nil {
 		return "", "", err
 	}

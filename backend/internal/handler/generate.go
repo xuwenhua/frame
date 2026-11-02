@@ -225,6 +225,24 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 			}
 		}
 
+		// 音色样本：按角色顺序收集，编号要和描述词里「音色参考@音频N」对上。
+		// 只有传了音频的角色才占号 —— 文字描述的角色的不占位。
+		{
+			board.FillRefs()
+			var audios []string
+			for _, r := range board.Roles {
+				if strings.TrimSpace(r.ID) == "" {
+					continue
+				}
+				if ch, e := h.charRepo.GetByID(r.ID); e == nil && strings.TrimSpace(ch.VoiceSample) != "" {
+					audios = append(audios, ch.VoiceSample)
+				}
+			}
+			if len(audios) > 0 {
+				p["audioUrls"] = audios
+			}
+		}
+
 		// 选了 360 视频：地点行整行换成「在参考视频 1 的场景中 + 人物站位」。
 		//
 		// 为什么连家具描述一起删：空间已由视频给出，文字再写一遍只会和视频里的

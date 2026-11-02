@@ -5,11 +5,12 @@ import "testing"
 // NormalizeAspect：前端传简写，节点只认完整枚举
 //
 // 2026-10-27 实测（node 252 ResolutionSelector）：
-//   "16:9"                          → KeyError: '16:9'
-//   "16:9 (Landscape Widescreen)"   → KeyError
-//   "16:9 (Landscape)"              → KeyError
-//   "16:9 (Horizontal)"             → KeyError
-//   "16:9 (Widescreen)"             → 进入 RUNNING ✅
+//
+//	"16:9"                          → KeyError: '16:9'
+//	"16:9 (Landscape Widescreen)"   → KeyError
+//	"16:9 (Landscape)"              → KeyError
+//	"16:9 (Horizontal)"             → KeyError
+//	"16:9 (Widescreen)"             → 进入 RUNNING ✅
 func TestNormalizeAspect(t *testing.T) {
 	spec := RHWorkflowByName("minimax-h3-final")
 
@@ -74,7 +75,7 @@ func TestAspectNodeMustHaveOptions(t *testing.T) {
 // 端到端：BuildRHInputs 出来的画幅必须是枚举里的完整写法
 func TestBuildRHInputsAspectIsFullEnum(t *testing.T) {
 	spec := RHWorkflowByName("minimax-h3-final")
-	inputs, err := BuildRHInputs(spec, "p", "16:9", []string{"/a.png"}, "", 0)
+	inputs, err := BuildRHInputs(spec, "p", "16:9", []string{"/a.png"}, "", nil, 0)
 	if err != nil {
 		t.Fatalf("构建失败: %v", err)
 	}
