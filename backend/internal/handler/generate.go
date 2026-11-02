@@ -258,18 +258,6 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 			p["refImages"] = urls
 			modelPrompt = service.RewriteMentionsForModel(basePrompt, names, kinds)
 		}
-		// 用了 360 全景视频当空间参考时，得在提示词里点明这件事：
-		// 否则模型会把视频当成「要模仿的镜头」，跟着它的运镜走
-		if req.SceneRef == "video" {
-			// 实测教训：光写「不要跟着参考视频的运镜走」不够 ——
-			// 全景视频本身是高位俯视/球面展开的，模型会连视角一起抄，
-			// 出来是天花板往下拍的俯视图。必须把机位高度和平视要求写死。
-			modelPrompt += "\n\n【空间参考】参考视频只用来确认这个房间的空间结构：" +
-				"墙面、地面、家具、陈设的相对位置与它保持一致，不要重新设计房间。" +
-				"**机位不要照搬参考视频**：摄影机保持在人物视线高度（约 1.2–1.5 米），" +
-				"平视或轻微俯仰，禁止高空俯拍、禁止球面/鱼眼畸变、禁止广角拉伸。" +
-				"景别按本段要求的来，参考视频的运镜一律不要跟。"
-		}
 		if len(p) > 0 {
 			if raw, e := json.Marshal(p); e == nil {
 				params = string(raw)
