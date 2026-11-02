@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"jikeai-clone/internal/model"
 	"jikeai-clone/pkg/aiclient"
@@ -206,7 +205,7 @@ func (s *LLMStoryboardService) GenerateOne(
 	ctx context.Context,
 	item OutlineItem,
 	total int,
-	script, prevEnd, baseSituation, sceneRef string,
+	script, prevEnd, baseSituation, sceneRef, retryHint string,
 	chars []model.Character,
 	scenes []model.Scene,
 	items []model.Item,
@@ -217,7 +216,8 @@ func (s *LLMStoryboardService) GenerateOne(
 	}
 	res, err := s.client.Chat(ctx, []aiclient.ChatMessage{
 		{Role: "system", Content: expandSystemPrompt()},
-		{Role: "user", Content: expandUserPrompt(item, total, script, prevEnd, baseSituation, sceneRef, scenes)},
+		{Role: "user", Content: expandUserPrompt(item, total, script, prevEnd, baseSituation, sceneRef, scenes) +
+			retryHint},
 	}, 0.5, 12000)
 	if err != nil {
 		return empty, fmt.Errorf("第 %d 段生成失败: %w", item.Index, err)
@@ -284,12 +284,17 @@ func (s *LLMStoryboardService) GenerateStream(
 		// 后面每一段都被要求「学生站在椅子旁」，和上一段尾帧的「保持坐姿」直接打架，
 		// 模型选了这个更强的措辞 —— 段 8 坐着、段 9 又站起来，就是这么来的。
 		// 位置和姿态由 prevEnd 一段段链式传下去，才是唯一真相。
-		d, err := s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef, chars, scenes, items)
-		if err != nil {
-			// 单段失败重试一次（模型偶发返回半截 JSON）
-			log.Printf("分镜第 %d 段失败，重试一次：%v", item.Index, err)
-			time.Sleep(1500 * time.Millisecond)
-			d, err = s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef, chars, scenes, items)
+		d, err := s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef, "", chars, scenes, items)
+
+		// 站位必须写明「坐哪一侧」—— 每段都是独立生成的视频，模型看不到上一段，
+		// 只写「坐在对面」它就只能自己摆，整集座位来回换。缺了就重试一次。
+		if err == nil && !hasSeatWords(d.Situation) {
+			log.Printf("分镜第 %d 段站位缺方位，重试：%s", item.Index, truncateStr(d.Situation, 60))
+			d, err = s.GenerateOne(ctx, item, len(outline), script, prevEnd, "", sceneRef,
+				"\n\n【上一版的问题】situation 里没有写清「人物坐在哪一侧」，只有「坐在对面」这种描述。"+
+					"这一段是独立生成的视频，模型看不到别的段落，必须在这一段里把位置写死："+
+					"主角坐在「靠 XX 一侧」，对方坐在「靠 XX 一侧」，用场景里真实存在的参照物（书架/窗/白板/门口）。",
+				chars, scenes, items)
 		}
 		if err != nil {
 			log.Printf("分镜第 %d 段连续失败，跳过：%v", item.Index, err)
@@ -427,4 +432,14 @@ func draftFromRaw(f llmFrameRaw, idx int, chars []model.Character, scenes []mode
 	d.Duration = EstimateFrameDuration(d)
 	d.VideoPrompt = composeVideoPrompt(d, f.ShotProgression, d.Duration)
 	return d
+}
+
+// hasSeatWords 判断站位描述里有没有「哪一侧」的信息。
+func hasSeatWords(s string) bool {
+	for _, k := range []string{"靠", "一侧", "一边", "左侧", "右侧", "东侧", "西侧", "内侧", "外侧", "桌后", "桌前"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
 }
