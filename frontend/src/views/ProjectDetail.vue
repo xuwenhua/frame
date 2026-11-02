@@ -844,8 +844,8 @@ const generateOneVideo = async (f: any) => {
       storyboardId: f.id,
       modelId: videoModel.value || undefined,
       duration: dur,
-      aspectRatio: sbRatio.value,
-      sceneRef: sbSceneRef.value
+      aspectRatio: sbRatio.value
+      // 不传 sceneRef：出片一律用分镜上记录的那个（生成分镜时定下来的）
     })
     toast.success(`已提交第 ${f.frameIndex} 段视频`, `${dur} 秒 · ${sbRatio.value}`)
     pollTasks()
@@ -874,8 +874,8 @@ const generateVideos = async () => {
         storyboardId: f.id,
         modelId: videoModel.value || undefined,
         duration: Math.max(1, Math.round(Number(f.duration) || 5)),
-        aspectRatio: sbRatio.value,
-        sceneRef: sbSceneRef.value
+        aspectRatio: sbRatio.value
+        // 同上：用分镜记录的场景参考
       })
       submitted++
     } catch (e: any) {
@@ -1728,7 +1728,16 @@ onUnmounted(() => {
           <div class="sb-left">
             <PillSelect v-model="sbDuration" label="时长" :options="DURATION_OPTIONS" />
             <PillSelect v-model="sbRatio" label="画幅" :options="RATIO_OPTIONS" />
-            <PillSelect v-model="sbSceneRef" label="场景参考" :options="SCENE_REF_OPTIONS" :width="132" />
+            <!-- 分镜生成后这里锁死：描述词的详略是按生成时那个选择写的，
+                 中途换素材会让提示词和实际喂给模型的素材对不上。
+                 要改就回资产页改完重新生成分镜。 -->
+            <PillSelect
+              v-model="sbSceneRef"
+              label="场景参考"
+              :options="SCENE_REF_OPTIONS"
+              :width="132"
+              :disabled="frames.length > 0"
+            />
             <PillSelect
               v-if="videoModelOptions.length"
               v-model="videoModel"
