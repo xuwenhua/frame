@@ -408,7 +408,28 @@ func (h *FirstFrameHandler) Generate(c *gin.Context) {
 			}
 		}
 
-		refs := make([]string, 0, len(roles)+len(scenes)+len(items))
+		refs := make([]string, 0, len(roles)+len(scenes)+len(items)+1)
+
+		// 空间基准图排第一：优先用「已生成的任意一组首帧」，没有才用场景图。
+		//
+		// 为什么：每段独立出图时，模型对「桌子长什么样、有几把椅子、窗户在哪」
+		// 每次理解都略有不同 —— 十段拼起来就像换了十个房间。
+		// 拿一张已经定稿的首帧当第一参考，家具直接从那张图抄，
+		// 一致性比单纯给场景资产图强得多（场景图是空房渲染，风格也和成片不一样）。
+		baseline := ""
+		for _, other := range list {
+			if other.ID == g.ID {
+				continue
+			}
+			if u := strings.TrimSpace(other.Image); u != "" && !strings.Contains(u, "placeholder://") {
+				baseline = stripQuery(u)
+				break
+			}
+		}
+		if baseline != "" {
+			refs = append(refs, baseline)
+		}
+
 		for _, r := range roles {
 			if u := strings.TrimSpace(r.ReferenceImage); u != "" && !strings.Contains(u, "placeholder://") {
 				refs = append(refs, stripQuery(u))
