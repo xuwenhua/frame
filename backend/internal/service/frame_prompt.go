@@ -475,7 +475,18 @@ func facingLine(sh FrameShot, d FrameDraft) string {
 // 图位顺序是「首帧图 → 角色 → 场景 → 道具」（见 frameRefSlots），
 // 和示例里的「角色→角色→场景」不同，写死编号必然错位。
 // 提交时 RewriteMentionsForModel 会按真实顺序换成 <Picture N>。
+// UseRef2VA 是否用「短剧 H3 六段式」输出描述词。
+//
+// 六段式（subject_definitions / summary / retention_analysis /
+// detailed_description / overall_soundscape / non_diegetic_music）是 H3 官方
+// Ref2VA 写法，带绝对时间码，实测动作时序比旧的「场次/镜号」格式稳得多。
+// 留这个开关是为了出问题时能一键切回旧格式（老分镜的描述词仍是旧格式）。
+var UseRef2VA = true
+
 func BuildFrameVideoPrompt(d FrameDraft, duration int) string {
+	if UseRef2VA {
+		return BuildRef2VAPrompt(d, duration)
+	}
 	shots := normalizeShots(d)
 
 	// 时长：优先用调用方给的；传 0 表示「自动」，按内容估算

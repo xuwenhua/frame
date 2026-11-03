@@ -2,6 +2,7 @@ package service
 
 import (
 	"math"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -9,6 +10,13 @@ import (
 
 	"jikeai-clone/internal/model"
 )
+
+// 这些用例断言的是「场次/镜号」旧格式，跑测试时把六段式关掉。
+// 六段式有独立的 ref2va_prompt_test.go 覆盖。
+func TestMain(m *testing.M) {
+	UseRef2VA = false
+	os.Exit(m.Run())
+}
 
 func sampleDraft() FrameDraft {
 	return FrameDraft{
