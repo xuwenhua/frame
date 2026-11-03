@@ -45,7 +45,7 @@ func SeedModelConfigs(db *gorm.DB) {
 		{"image", "豆包 Seedream", "doubao-seedream-3.0", "volcengine",
 			"https://ark.cn-beijing.volces.com/api/v3", `{}`, 0, 30, "", 20},
 		{"image", "RH 中转 · Moss Image", "moss-image", "rh-proxy",
-			"https://www.runninghub.cn", , 0, 45, "纯文生图", 20},
+			"https://www.runninghub.cn", `{"workflow":"moss-image","aspectRatio":"9:16"}`, 0, 45, "纯文生图", 20},
 		{"image", "RH 中转 · Qwen 文生图", "qwen-text2img", "rh-proxy",
 			"https://www.runninghub.cn", `{"workflow":"qwen-text2img"}`, 0, 40, "", 20},
 		{"image", "RH 中转 · Krea2 文生图", "krea2-text2img", "rh-proxy",
