@@ -107,8 +107,17 @@ func stripCameraWords(s string) string {
 func BuildGroupFirstFramePrompt(description, vp string, roles []model.Character, scenes []model.Scene, items []model.Item) string {
 	var b strings.Builder
 
-	b.WriteString("把参考图合成一张这个场景的**全景空间参考图**：室内效果图视角，")
-	b.WriteString("从斜上方俯看整个房间，能看清家具布局、每个人坐在或站在哪里、身体朝哪边。\n\n")
+	// 视角：正面平视，不是俯视。
+	//
+	// 之前写的是「从斜上方俯看整个房间」，出来是效果图那种斜角 ——
+	// 一旦首帧是斜角，提示词里就没法用「画面左侧 / 右侧」描述座位：
+	// 斜角下左右是斜的，模型每次理解都不同。
+	// 改成正面平视 + 桌子横置之后，场景图自己定义了左右坐标系：
+	// 「画面左侧」永远指同一个座位，过肩反打也不会让观众觉得人换了地方。
+	b.WriteString("把参考图合成一张**正面平视的全景图**：摄影机与桌面同高、镜头正对房间，")
+	b.WriteString("桌子横置于画面中部，两个人分坐桌子两侧 —— 一个在画面左侧、一个在画面右侧，")
+	b.WriteString("两人身体互相朝向、隔桌相对而坐，视线交汇。")
+	b.WriteString("不要斜角、不要俯视、不要仰视、不要只拍半张桌子。\n\n")
 
 	// 参考图只标「谁是谁」，不逐个复述外观。
 	// 模型看图比读文字准，写一大段「深蓝色保温杯、外壳为哑光烤漆不锈钢、

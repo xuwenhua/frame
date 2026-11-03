@@ -502,10 +502,10 @@ func (s *LLMStoryboardService) PlanSeats(ctx context.Context, chars []model.Char
 			fmt.Fprintf(&sb, "- %s：%s\n", sc.Name, strings.TrimSpace(sc.SpatialAnchor))
 		}
 	}
-	sb.WriteString("\n座位写法：**位置 + 参照物方位 + 椅子外观**，例如「办公桌靠窗那一侧、离门口最近的那把深灰布面转椅」。\n")
+	sb.WriteString("\n座位写法用**画面左右**：「画面左侧的椅子（背靠窗、正对镜头）」「画面右侧的椅子（靠门、侧对镜头）」。\n")
+	sb.WriteString("为什么可以用左右：首帧图是正面平视、桌子横置，画面左右就是场景的左右，整集不变。\n")
 	sb.WriteString("椅子外观必须是你在这张图里**真的看到的**，不要凭「办公室一般有什么」猜。\n")
-	sb.WriteString("不要用「左边」「右边」—— 画面方向会随机位翻转。\n")
-	sb.WriteString("只输出 JSON，不要解释：{\"老师\":\"办公桌靠窗那一侧、离门口最近的那把深灰布面转椅\",\"学生\":\"...\"}\n")
+	sb.WriteString("只输出 JSON，不要解释：{\"老师\":\"画面左侧的椅子（背靠窗、正对镜头）\",\"学生\":\"画面右侧的椅子（靠门、侧对镜头）\"}\n")
 
 	// 带上场景图：模型看着图说话，才不会编出「木质靠背椅」这种场景里根本没有的东西
 	var content any = sb.String()
