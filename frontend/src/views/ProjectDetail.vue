@@ -986,13 +986,13 @@ const ffBusyIds = ref<string[]>([])
 
 /** 某一组是不是正在生成（已失败的不再算「生成中」，否则界面会一直转圈） */
 const isFfBusy = (g: any) =>
-  ffGenBusy.value && !!g && ffBusyIds.value.includes(g.id) && g.taskStatus !== 'failed'
+  !!g && ffBusyIds.value.includes(g.id) && g.taskStatus !== 'failed'
 
 /** 只重出某一组首帧：某段构图不对时单独重来，不用整批重跑 */
 const genOneFirstFrame = async (g: any) => {
-  if (!g?.id || ffGenBusy.value) return
-  ffGenBusy.value = true
-  ffBusyIds.value = [g.id]
+  // 允许同时重出多组：只有这一组自己在跑时才拦，别人不受影响
+  if (!g?.id || ffBusyIds.value.includes(g.id)) return
+  ffBusyIds.value = [...ffBusyIds.value, g.id]
   const before = g.image || ''
   try {
     const res: any = await api.post(`/episodes/${episodeId.value}/firstframes/generate`, {
@@ -1010,8 +1010,7 @@ const genOneFirstFrame = async (g: any) => {
       const done = !cur || cur.taskStatus === 'failed' || (!!cur.image && cur.image !== before)
       if (done || tries >= 40) {
         window.clearInterval(timer)
-        ffGenBusy.value = false
-        ffBusyIds.value = []
+        ffBusyIds.value = ffBusyIds.value.filter((id: string) => id !== g.id)
         if (cur?.taskStatus === 'failed') {
           toast.error('这一组生成失败', cur.taskError || '上游报错，可再试一次')
         } else if (cur?.image && cur.image !== before) {
@@ -1022,8 +1021,7 @@ const genOneFirstFrame = async (g: any) => {
       }
     }, 4000)
   } catch (e: any) {
-    ffGenBusy.value = false
-    ffBusyIds.value = []
+    ffBusyIds.value = ffBusyIds.value.filter((id: string) => id !== g.id)
     toast.error('提交失败', e.response?.data?.message || e.message)
   }
 }
@@ -2296,7 +2294,7 @@ onUnmounted(() => {
                     <button class="link-btn" @click="saveGroupDesc(g)">保存描述</button>
                     <button
                       class="link-btn accent"
-                      :disabled="ffGenBusy"
+                      :disabled="ffBusyIds.includes(g.id)"
                       @click="genOneFirstFrame(g)"
                     >
                       {{ ffBusyIds.includes(g.id) ? '生成中…' : g.image ? '重出这张' : '单独生成' }}
