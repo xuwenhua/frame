@@ -1297,13 +1297,19 @@ func RewriteMentionsForModel(videoPrompt string, names, kinds []string) string {
 		out = strings.ReplaceAll(out, "【@"+p.name+"台词】", "【"+p.tag+"台词】")
 	}
 
-	var b strings.Builder
-	b.WriteString("subject_definitions:\n")
-	for _, d := range defs {
-		b.WriteString(d + "\n")
+	// 六段式提示词自带 subject_definitions（含 OUTFIT LOCKED / POSITION LOCKED
+	// 这些锁定清单），这里再加一遍就会出现两套定义，模型不知道听谁的 ——
+	// 实测出过「<Picture 1> 是学生」和「<Subject 1> is 老师, from <Picture 1>」
+	// 同时出现在开头，人物直接对调。
+	if !strings.Contains(videoPrompt, "subject_definitions:") {
+		var b strings.Builder
+		b.WriteString("subject_definitions:\n")
+		for _, d := range defs {
+			b.WriteString(d + "\n")
+		}
+		b.WriteString("\n")
+		out = b.String() + out
 	}
-	b.WriteString("\n")
-	out = b.String() + out
 
 	// retention_analysis 按官方顺序排在 detailed_description 之前：
 	// subject_definitions 说「这张图是什么」，retention_analysis 说「拿它锁什么、允许变什么」

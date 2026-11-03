@@ -2,6 +2,8 @@ package service
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -35,9 +37,18 @@ func BuildRef2VAPrompt(d FrameDraft, duration int) string {
 		cursor += float64(secs[i])
 	}
 
-	// 图位编号：角色 → 场景 → 道具
+	// 图位编号：必须和 frameRefSlots 的推送顺序完全一致，
+	// 否则整份提示词引用错位（实测出过：首帧图占了 Picture 1，
+	// 提示词却说 Picture 1 是老师 —— 模型把首帧当成老师，人物全乱）。
+	//
+	// frameRefSlots 的顺序是：首帧图（若有）→ 角色 → 场景 → 道具。
+	// 所以有首帧时，编号从 2 开始。
 	picIdx := map[string]int{}
 	next := 1
+	hasFirstFrame := strings.TrimSpace(d.FirstFrameImage) != ""
+	if hasFirstFrame {
+		next = 2 // Picture 1 留给首帧图
+	}
 	for _, r := range d.Roles {
 		if _, ok := picIdx[r.Name]; !ok && strings.TrimSpace(r.Name) != "" {
 			picIdx[r.Name] = next
@@ -61,6 +72,12 @@ func BuildRef2VAPrompt(d FrameDraft, duration int) string {
 
 	// ---- 1. subject_definitions ----
 	b.WriteString("subject_definitions:\n")
+	if hasFirstFrame {
+		b.WriteString("<Subject 0> is the opening frame of this shot, from <Picture 1>. ")
+		b.WriteString("This is the exact first frame of the video: camera angle, framing, ")
+		b.WriteString("everyone's position and pose, furniture layout and lighting ")
+		b.WriteString("must all match it exactly at t=0, then the action develops from there.\n")
+	}
 	for i, r := range d.Roles {
 		n, ok := picIdx[r.Name]
 		if !ok {
@@ -197,4 +214,45 @@ func firstClause(s string) string {
 		return s[:60]
 	}
 	return s
+}
+
+// ShiftPictureRefs 把提示词里的 <Picture N> 全部 +offset。
+//
+// 用在「首帧图后补」的场景：分镜生成时还没有首帧，提示词按
+// Picture 1=老师、2=学生 编号；等首帧出好了再出片，图位变成
+// 1=首帧、2=老师、3=学生 —— 不整体后移一位，模型就把首帧当成了老师。
+//
+// 从大到小替换，避免 1→2 之后又被 2→3 连锁改掉。
+func ShiftPictureRefs(prompt string, offset int) string {
+	if offset <= 0 || prompt == "" {
+		return prompt
+	}
+	// 先找出最大编号
+	re := regexp.MustCompile(`<Picture (\d+)>`)
+	matches := re.FindAllStringSubmatch(prompt, -1)
+	maxN := 0
+	for _, m := range matches {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > maxN {
+			maxN = n
+		}
+	}
+	for i := maxN; i >= 1; i-- {
+		prompt = strings.ReplaceAll(prompt,
+			fmt.Sprintf("<Picture %d>", i),
+			fmt.Sprintf("<Picture %d>", i+offset))
+	}
+	return prompt
+}
+
+// PrependFirstFrameSubject 在 subject_definitions 开头补一条首帧声明。
+func PrependFirstFrameSubject(prompt string) string {
+	const anchor = "subject_definitions:/n"
+	if !strings.Contains(prompt, anchor) {
+		return prompt
+	}
+	decl := "<Subject 0> is the opening frame of this shot, from <Picture 1>. " +
+		"This is the exact first frame of the video: camera angle, framing, " +
+		"everyone's position and pose, furniture layout and lighting " +
+		"must all match it exactly at t=0, then the action develops from there.\n"
+	return strings.Replace(prompt, anchor, anchor+decl, 1)
 }

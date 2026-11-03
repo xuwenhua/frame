@@ -988,6 +988,46 @@ const ffBusyIds = ref<string[]>([])
 const isFfBusy = (g: any) =>
   ffGenBusy.value && !!g && ffBusyIds.value.includes(g.id) && g.taskStatus !== 'failed'
 
+/** 只重出某一组首帧：某段构图不对时单独重来，不用整批重跑 */
+const genOneFirstFrame = async (g: any) => {
+  if (!g?.id || ffGenBusy.value) return
+  ffGenBusy.value = true
+  ffBusyIds.value = [g.id]
+  const before = g.image || ''
+  try {
+    const res: any = await api.post(`/episodes/${episodeId.value}/firstframes/generate`, {
+      groupIds: [g.id]
+    })
+    toast.success(res.message || `第 ${g.sortOrder ?? ''} 组已提交`)
+    let tries = 0
+    const timer = window.setInterval(async () => {
+      tries++
+      try {
+        const r: any = await api.get(`/episodes/${episodeId.value}/firstframes`)
+        ffGroups.value = r.data || []
+      } catch { /* 忽略 */ }
+      const cur = ffGroups.value.find((x: any) => x.id === g.id)
+      const done = !cur || cur.taskStatus === 'failed' || (!!cur.image && cur.image !== before)
+      if (done || tries >= 40) {
+        window.clearInterval(timer)
+        ffGenBusy.value = false
+        ffBusyIds.value = []
+        if (cur?.taskStatus === 'failed') {
+          toast.error('这一组生成失败', cur.taskError || '上游报错，可再试一次')
+        } else if (cur?.image && cur.image !== before) {
+          toast.success('已更新')
+        } else {
+          toast.warning('还在生成，稍后刷新查看')
+        }
+      }
+    }, 4000)
+  } catch (e: any) {
+    ffGenBusy.value = false
+    ffBusyIds.value = []
+    toast.error('提交失败', e.response?.data?.message || e.message)
+  }
+}
+
 const genFirstFrameGroups = async () => {
   if (!episodeId.value || ffGenBusy.value) return
   ffGenBusy.value = true
@@ -2252,7 +2292,16 @@ onUnmounted(() => {
                 <textarea v-model="g.description" v-autosize class="ffg-desc" rows="3"></textarea>
                 <div class="ffg-foot">
                   <span class="ffg-frames">覆盖：{{ parseIdx(g.frameIndexes).join('、') }}</span>
-                  <button class="link-btn" @click="saveGroupDesc(g)">保存描述</button>
+                  <span class="ffg-actions">
+                    <button class="link-btn" @click="saveGroupDesc(g)">保存描述</button>
+                    <button
+                      class="link-btn accent"
+                      :disabled="ffGenBusy"
+                      @click="genOneFirstFrame(g)"
+                    >
+                      {{ ffBusyIds.includes(g.id) ? '生成中…' : g.image ? '重出这张' : '单独生成' }}
+                    </button>
+                  </span>
                 </div>
               </div>
             </div>
@@ -3640,4 +3689,16 @@ onUnmounted(() => {
   color: #7aa7ff;
 }
 .voice-input { width: 100%; }
+.ffg-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+.link-btn.accent {
+  color: #7aa7ff;
+}
+.link-btn.accent:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 </style>

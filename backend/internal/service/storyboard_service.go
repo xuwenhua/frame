@@ -53,6 +53,10 @@ type FrameDraft struct {
 	// 由 PlanSeats 一次定死，每段拼站位时直接查表，不让模型自由发挥。
 	SeatMap map[string]string
 
+	// FirstFrameImage 这一段的定稿首帧图。有值时它就是 <Picture 1>，
+	// 图位编号整体后移一位（见 BuildRef2VAPrompt）。
+	FirstFrameImage string
+
 	// 尾帧画面：这一段结束时人物 / 环境 / 道具的状态。
 	// 逐段生成时它是下一段唯一的上文依据 —— 人物位置和姿态靠它"传下去"，
 	// 而不是让模型每段各自回忆。

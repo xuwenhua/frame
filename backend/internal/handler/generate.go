@@ -169,7 +169,36 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 	// EnsureSpeechRate 给老分镜补「语气：约 X 字/秒」—— 旧描述词里没有语速行，
 	// 模型只能靠字数÷时长自己猜，念快了嘴跟不上、念慢了片子被截。
 	// 就地补而不是重跑分镜：重跑会清掉已绑定的全景参考图，还要重新出图花积分。
+	// 优先用「所属分组」的首帧图：同机位的所有段共用一张，空间和人物位置才锁得住。
+	// 没有规划结果时退回帧级 first_frame_image（按帧单独合成的那套）。
+	if h.ffRepo != nil {
+		if groups, e := h.ffRepo.ListByEpisodeID(board.EpisodeID); e == nil {
+			log.Printf("[首帧] 段%d 查到 %d 组首帧", board.FrameIndex, len(groups))
+			for _, g := range groups {
+				if strings.TrimSpace(g.Image) == "" {
+					continue
+				}
+				var idxs []int
+				_ = json.Unmarshal([]byte(g.FrameIndexes), &idxs)
+				for _, idx := range idxs {
+					if idx == board.FrameIndex {
+						board.FirstFrameImage = g.Image
+						log.Printf("[首帧] 段%d 命中组 %s", board.FrameIndex, g.ID[:8])
+						break
+					}
+				}
+			}
+		}
+	}
 	basePrompt := service.EnsureSpeechRate(board.VideoPrompt)
+
+	// 首帧是分镜生成之后才补的，提示词里的 <Picture N> 还是「从 1 开始数角色」。
+	// 出片时图位变成「首帧占 1、角色从 2 起」，不整体后移一位，
+	// 模型就把首帧当成了第一个角色 —— 实测视频里人物位置和首帧完全对不上。
+	if strings.TrimSpace(board.FirstFrameImage) != "" && strings.Contains(basePrompt, "subject_definitions:") {
+		basePrompt = service.ShiftPictureRefs(basePrompt, 1)
+		basePrompt = service.PrependFirstFrameSubject(basePrompt)
+	}
 	modelPrompt := basePrompt
 
 	// 工具栏选择落到任务参数里，由队列在出片时覆盖模型默认值
@@ -202,25 +231,6 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 				if full, e := h.sceneRepo.GetByID(sc.ID); e == nil && strings.TrimSpace(full.PanoramaVideo) != "" {
 					p["videoUrl"] = full.PanoramaVideo
 					break
-				}
-			}
-		}
-		// 优先用「所属分组」的首帧图：同机位的所有段共用一张，空间和人物位置才锁得住。
-		// 没有规划结果时退回帧级 first_frame_image（按帧单独合成的那套）。
-		if h.ffRepo != nil {
-			if groups, e := h.ffRepo.ListByEpisodeID(board.EpisodeID); e == nil {
-				for _, g := range groups {
-					if strings.TrimSpace(g.Image) == "" {
-						continue
-					}
-					var idxs []int
-					_ = json.Unmarshal([]byte(g.FrameIndexes), &idxs)
-					for _, idx := range idxs {
-						if idx == board.FrameIndex {
-							board.FirstFrameImage = g.Image
-							break
-						}
-					}
 				}
 			}
 		}
