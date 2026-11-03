@@ -40,6 +40,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
+	// 补齐内置模型清单：配置只存在本机 SQLite，换机器就空了。
+	// 按 model_id 比对，缺的补、已有不动（用户的 key 和参数优先）。
+	service.SeedModelConfigs(db)
 
 	// ===== Repository =====
 	projectRepo := repository.NewProjectRepository(db)
