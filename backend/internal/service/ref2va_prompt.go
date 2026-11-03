@@ -245,14 +245,45 @@ func ShiftPictureRefs(prompt string, offset int) string {
 }
 
 // PrependFirstFrameSubject 在 subject_definitions 开头补一条首帧声明。
+//
+// 用「定位 subject_definitions: 再插入」会被前导空白/换行差异搞挂（实测插不进去），
+// 所以直接拼在整份提示词最前面 —— 它在语义上就是 subject_definitions 的第一条。
 func PrependFirstFrameSubject(prompt string) string {
-	const anchor = "subject_definitions:/n"
-	if !strings.Contains(prompt, anchor) {
+	if !strings.Contains(prompt, "subject_definitions:") {
 		return prompt
+	}
+	if strings.Contains(prompt, "<Subject 0>") {
+		return prompt // 已经加过
 	}
 	decl := "<Subject 0> is the opening frame of this shot, from <Picture 1>. " +
 		"This is the exact first frame of the video: camera angle, framing, " +
 		"everyone's position and pose, furniture layout and lighting " +
 		"must all match it exactly at t=0, then the action develops from there.\n"
-	return strings.Replace(prompt, anchor, anchor+decl, 1)
+	// 插在 "subject_definitions:" 这一行之后
+	idx := strings.Index(prompt, "subject_definitions:")
+	if idx < 0 {
+		return decl + prompt
+	}
+	lineEnd := strings.Index(prompt[idx:], "\n")
+	if lineEnd < 0 {
+		return prompt + "\n" + decl
+	}
+	cut := idx + lineEnd + 1
+	return prompt[:cut] + decl + prompt[cut:]
+}
+
+// DropEnvironmentSubject 删掉 subject_definitions 里的 environment 那一行。
+//
+// 有首帧时场景图不再传给模型（首帧本身就是定稿画面），提示词里还留着
+// "<Subject N> is the environment, from <Picture M>" 会指向一个不存在的图位。
+func DropEnvironmentSubject(prompt string) string {
+	lines := strings.Split(prompt, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if strings.Contains(ln, "is the environment") && strings.Contains(ln, "<Picture") {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }

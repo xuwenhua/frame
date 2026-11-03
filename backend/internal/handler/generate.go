@@ -198,6 +198,8 @@ func (h *GenerateHandler) GenerateVideo(c *gin.Context) {
 	if strings.TrimSpace(board.FirstFrameImage) != "" && strings.Contains(basePrompt, "subject_definitions:") {
 		basePrompt = service.ShiftPictureRefs(basePrompt, 1)
 		basePrompt = service.PrependFirstFrameSubject(basePrompt)
+		// 场景图不再传了，提示词里那行 environment 也要删 —— 否则指向空图位
+		basePrompt = service.DropEnvironmentSubject(basePrompt)
 	}
 	modelPrompt := basePrompt
 
@@ -900,17 +902,21 @@ func (h *GenerateHandler) frameRefSlots(board *model.Storyboard, sceneRef string
 		for _, s := range scenes {
 			push(s.URL, s.Name, s.Kind)
 		}
-		// 正文兜底：场景名在提示词里出现但 scenesJson 没标
-		knownScene := map[string]bool{}
-		for _, s := range board.Scenes {
-			knownScene[s.Name] = true
-		}
-		for _, sc := range allScenes {
-			if knownScene[sc.Name] {
-				continue
+		// 正文兜底：场景名在提示词里出现但 scenesJson 没标。
+		// 有首帧时整段跳过 —— 首帧已经是这张场景的定稿画面，
+		// 再塞一张空房渲染进去，模型会在「照着首帧」和「照着场景图」之间摇摆。
+		if !hasFirstFrame {
+			knownScene := map[string]bool{}
+			for _, s := range board.Scenes {
+				knownScene[s.Name] = true
 			}
-			if strings.Contains(board.VideoPrompt, "@"+sc.Name) {
-				push(sc.ReferenceImage, sc.Name, "scene")
+			for _, sc := range allScenes {
+				if knownScene[sc.Name] {
+					continue
+				}
+				if strings.Contains(board.VideoPrompt, "@"+sc.Name) {
+					push(sc.ReferenceImage, sc.Name, "scene")
+				}
 			}
 		}
 	}
