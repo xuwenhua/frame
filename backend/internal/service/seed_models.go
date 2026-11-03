@@ -54,6 +54,9 @@ func SeedModelConfigs(db *gorm.DB) {
 		// ---- 文本 ----
 		{"llm", "DeepSeek Chat", "auto/deepseek-v4.1-flash", "deepseek",
 			"http://127.0.0.1:3425/v1", `{"temperature":0.7,"maxTokens":8192}`, 1, 10, "分镜/大纲主力，支持看图", 0},
+		{"llm", "Gemini 4 Argon", "gemini-4-argon", "gemini",
+			"https://opencode.ai/inference/go/google", `{"temperature":0.7,"maxTokens":8192}`,
+			0, 30, "opencode.ai 中转，Google 原生 generateContent 协议", 0},
 		{"llm", "GPT-4o", "gpt-4o", "openai",
 			"https://api.openai.com/v1", `{"temperature":0.7,"maxTokens":4096}`, 0, 20, "", 0},
 

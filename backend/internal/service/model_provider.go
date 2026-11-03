@@ -29,18 +29,35 @@ func NewModelProvider(r *repository.ModelConfigRepository) *ModelProvider {
 func (p *ModelProvider) LLM() (*aiclient.LLMClient, *model.ModelConfig, error) {
 	cfg, err := p.modelRepo.GetDefault("llm")
 	if err == nil && cfg != nil && usableLLM(cfg) {
-		return aiclient.NewLLMClient(cfg.BaseURL, cfg.APIKey, cfg.ModelID), cfg, nil
+		return buildLLMClient(cfg), cfg, nil
 	}
 
 	list, lerr := p.modelRepo.List("llm")
 	if lerr == nil {
 		for i := range list {
 			if c := &list[i]; usableLLM(c) {
-				return aiclient.NewLLMClient(c.BaseURL, c.APIKey, c.ModelID), c, nil
+				return buildLLMClient(c), c, nil
 			}
 		}
 	}
 	return nil, cfg, errors.New("没有可用的文本模型（需要已启用，且配好 Base URL 与 API Key）")
+}
+
+// buildLLMClient 按 provider 选协议。
+//
+// 绝大多数中转是 OpenAI 兼容（/chat/completions），但 opencode.ai 的 Gemini
+// 只有 Google 原生 generateContent，没有兼容端点 —— 用同一套 body 发过去是 404。
+// 这里根据 provider 标记切到对应实现，调用方不用关心。
+func buildLLMClient(cfg *model.ModelConfig) *aiclient.LLMClient {
+	c := aiclient.NewLLMClient(cfg.BaseURL, cfg.APIKey, cfg.ModelID)
+	if strings.Contains(strings.ToLower(cfg.Provider), "gemini") ||
+		strings.Contains(strings.ToLower(cfg.Provider), "google") ||
+		strings.Contains(strings.ToLower(cfg.Provider), "opencode") {
+		c.Format = "gemini"
+		c.SessionHeader = "ses_" + cfg.ID[:8]
+		c.UserAgent = "opencode/2.2.0"
+	}
+	return c
 }
 
 func usableLLM(c *model.ModelConfig) bool {
@@ -61,7 +78,7 @@ func (p *ModelProvider) LLMByID(id string) (*aiclient.LLMClient, *model.ModelCon
 	if cfg.BaseURL == "" {
 		return nil, cfg, errors.New("未配置 Base URL")
 	}
-	return aiclient.NewLLMClient(cfg.BaseURL, cfg.APIKey, cfg.ModelID), cfg, nil
+	return buildLLMClient(cfg), cfg, nil
 }
 
 // TestLLM 真实发起一次轻量请求验证连通性
