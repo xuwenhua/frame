@@ -48,7 +48,7 @@ func TestRef2VASections(t *testing.T) {
 	if !strings.Contains(got, "<d>[Chinese] 坐。</d>") {
 		t.Fatalf("台词格式不对\n%s", got)
 	}
-	if !strings.Contains(got, "non_diegetic_music:/nN/A") {
+	if !strings.Contains(got, "non_diegetic_music:\nN/A") {
 		t.Fatalf("无 BGM 应写 N/A\n%s", got)
 	}
 	// 段落顺序必须固定
