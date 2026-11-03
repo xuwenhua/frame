@@ -154,8 +154,10 @@ const loadModels = async () => {
 
 // ---------- 分镜 ----------
 const frames = ref<any[]>([])
-// 首帧图功能开关：先下线（首帧图会锁死构图），代码保留可随时打开
-const ffEnabled = ref(false)
+// 首帧图功能：重新启用。
+// 每段单独出一张首帧 —— 出片时 H3 以它为第一帧，构图、发型、座位都锁在图上，
+// 比只给参考图 + 文字描述稳得多；画错了也能单独重出这一段，不用整场重来。
+const ffEnabled = ref(true)
 const generating = ref(false)
 // 逐段生成的进度（SSE 推过来的）
 const genProgress = ref({ done: 0, total: 0 })
