@@ -82,6 +82,13 @@ var RHWorkflows = []RHWorkflowSpec{
 		DefaultAspect: "9:16",
 	},
 	{
+		// 纯文生图：只有提示词（25）和画幅（19），没有任何图片输入位。
+		Name: "moss-image", Label: "Moss Image", Kind: "image",
+		Desc:       "纯文生图，提示词 25、画幅 19（1:1/2:3/3:2/3:4/4:3/9:16/16:9/21:9）",
+		PromptNode: "25", AspectNode: "19", AspectOptions: RHComfyAspectOptions,
+		DefaultAspect: "9:16",
+	},
+	{
 		Name: "qwen-image-2.1-pe", Label: "Qwen 图像编辑 2.1", Kind: "image",
 		Desc:       "图生图/换装换背景；默认必传 1 张参考图（476 必填，477 及 490-496 可选）",
 		PromptNode: "497", AspectNode: "13", AspectOptions: RHComfyAspectOptions,
