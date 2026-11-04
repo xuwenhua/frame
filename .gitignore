@@ -17,10 +17,9 @@ backend/.data/
 # 其余位置的 .db 一律忽略，避免把临时/备份文件提交上去
 *.db
 !data/jikeai.db
+# WAL / SHM 是运行时临时文件（程序开着才有），同步过去反而可能读到不一致状态
 *.db-wal
 *.db-shm
-!data/jikeai.db-wal
-!data/jikeai.db-shm
 
 # 生成的图/视频：1.4GB，不进仓库。
 # 换机器后旧产物打不开，但新生成的照样能用。
