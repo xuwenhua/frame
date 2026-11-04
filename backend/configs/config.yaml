@@ -27,18 +27,17 @@ app:
 
 # 数据库配置
 database:
-  driver: sqlite # sqlite / postgres / mysql
-  # 只写文件路径，不带 ?_journal_mode=... 这类驱动私有参数：
-  # WAL / busy_timeout 等 PRAGMA 统一在 database.Init 里执行，
-  # 换驱动（mattn ↔ modernc）时不会因为参数语法不同而静默失效。
-  dsn: "~/.jikeai-clone-data/jikeai.db"
-  # postgres 示例:
-  # host: localhost
-  # port: 5432
-  # user: postgres
-  # password: postgres
-  # dbname: jikeai
-  # sslmode: disable
+  # 已切到 PostgreSQL：本机装了 PostgreSQL 16，库名 jikeai。
+  # 换回 SQLite 就把 driver 改回 sqlite、dsn 指回 .db 文件即可，代码不用动。
+  driver: postgres
+  host: 127.0.0.1
+  port: 5432
+  user: postgres
+  password: postgres
+  dbname: jikeai
+  sslmode: disable
+  # SQLite 时期的配置（保留备查）：
+  # dsn: "~/.jikeai-clone-data/jikeai.db"
 
 # Redis 配置（可选，用于缓存和队列）
 redis:
