@@ -24,6 +24,9 @@ backend/.data/
 # 生成的图/视频：1.4GB，不进仓库。
 # 换机器后旧产物打不开，但新生成的照样能用。
 data/results/
+# 不带斜杠的 data/results 是符号链接（把旧产物目录链过来时建的），
+# 链的是本机绝对路径，提交上去换台机器就废了
+data/results
 
 # 依赖与构建产物
 node_modules/
