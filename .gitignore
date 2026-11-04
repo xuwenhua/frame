@@ -13,9 +13,18 @@ backend/bin/
 # 数据库与本地数据（含用户、积分、模型密钥，绝不能进仓库）
 backend/data/
 backend/.data/
+# 数据库：项目内的 data/jikeai.db 要跟着仓库走（两台电脑轮流开发，靠它同步数据）
+# 其余位置的 .db 一律忽略，避免把临时/备份文件提交上去
 *.db
+!data/jikeai.db
 *.db-wal
 *.db-shm
+!data/jikeai.db-wal
+!data/jikeai.db-shm
+
+# 生成的图/视频：1.4GB，不进仓库。
+# 换机器后旧产物打不开，但新生成的照样能用。
+data/results/
 
 # 依赖与构建产物
 node_modules/

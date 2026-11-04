@@ -10,7 +10,7 @@ app:
   # 用 ~ 表示当前用户主目录，由 config.Load 展开（Windows = C:\Users\<你>，
   # macOS/Linux = /home/<你>）。这样配置文件跨平台、跨机器都能直接跑，
   # 不用每换一台机器就手改绝对路径。
-  result_dir: "~/.jikeai-clone-data/results"
+  result_dir: "../data/results"
   result_url_prefix: "/static/results"
   # 任务并发上限：一个任务一个协程，有多少任务就同时提交多少；
   # 上游并发/排队由网关自己处理（queueTimeoutMs），本地不节流。
@@ -36,7 +36,10 @@ database:
   # 想改成网盘目录就把这一行换成绝对路径，例如：
   #   dsn: "D:/OneDrive/jikeai-data/jikeai.db"
   # 同时把上面 app.result_dir 也指到同一个父目录下，两边保持一致。
-  dsn: "~/.jikeai-clone-data/jikeai.db"
+  # 用项目内的相对路径：两台电脑拉同一个仓库，数据库跟着走，不用改配置。
+  # 路径相对于「工作目录」：启动.bat 会先 cd 到 backend/ 再跑，
+  # 所以 ../data 指项目根的 data/ 目录（数据库跟着仓库走，两台电脑路径一致）。
+  dsn: "../data/jikeai.db"
 
 # Redis 配置（可选，用于缓存和队列）
 redis:
