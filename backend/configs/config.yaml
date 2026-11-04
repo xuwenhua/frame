@@ -27,17 +27,16 @@ app:
 
 # 数据库配置
 database:
-  # 已切到 PostgreSQL：本机装了 PostgreSQL 16，库名 jikeai。
-  # 换回 SQLite 就把 driver 改回 sqlite、dsn 指回 .db 文件即可，代码不用动。
-  driver: postgres
-  host: 127.0.0.1
-  port: 5432
-  user: postgres
-  password: postgres
-  dbname: jikeai
-  sslmode: disable
-  # SQLite 时期的配置（保留备查）：
-  # dsn: "~/.jikeai-clone-data/jikeai.db"
+  # 用 SQLite：两台电脑轮流开发，整个数据目录放网盘同步。
+  # SQLite 是单文件，网盘直接同步就行；PostgreSQL 的数据目录没法跨机拷。
+  driver: sqlite
+  # 只写文件路径，不带 ?_journal_mode=... 这类驱动私有参数：
+  # WAL / busy_timeout 等 PRAGMA 统一在 database.Init 里执行。
+  #
+  # 想改成网盘目录就把这一行换成绝对路径，例如：
+  #   dsn: "D:/OneDrive/jikeai-data/jikeai.db"
+  # 同时把上面 app.result_dir 也指到同一个父目录下，两边保持一致。
+  dsn: "~/.jikeai-clone-data/jikeai.db"
 
 # Redis 配置（可选，用于缓存和队列）
 redis:
